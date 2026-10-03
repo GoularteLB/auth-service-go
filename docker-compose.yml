@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: auth
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no arquivo .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U auth -d auth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: .
+    entrypoint: ["/app/migrate", "up"]
+    environment:
+      AUTH_DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres:5432/auth?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  auth:
+    build: .
+    environment:
+      AUTH_ENV: ${AUTH_ENV:-development}
+      AUTH_LOG_LEVEL: ${AUTH_LOG_LEVEL:-info}
+      AUTH_DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres:5432/auth?sslmode=disable
+    ports:
+      - "127.0.0.1:${AUTH_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
