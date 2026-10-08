@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"runtime/debug"
 	"time"
+
+	"github.com/GoularteLB/auth-service/internal/audit"
 )
 
 type ctxKey int
@@ -62,6 +64,7 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 			slog.String("request_id", RequestIDFrom(r.Context())),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
+			slog.String("ip", audit.ClientFrom(r.Context()).IP),
 			slog.Int("status", rec.status),
 			slog.Duration("duration", time.Since(start)),
 		)

@@ -21,7 +21,10 @@ func newTestHandler(t *testing.T, db Pinger, production bool) http.Handler {
 	t.Helper()
 	return NewHandler(Deps{
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		DB:         db,
+		Checks:     map[string]Pinger{"postgres": db},
+		Auth:       newFakeAuth(),
+		Limiter:    newFakeLimiter(),
+		SessionTTL: time.Hour,
 		Production: production,
 	})
 }

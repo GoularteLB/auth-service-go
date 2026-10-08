@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"time"
 )
 
@@ -14,16 +15,36 @@ type Pinger interface {
 	Ping(ctx context.Context) error
 }
 
+var (
+	signupRate = Rate{Limit: 10, Window: time.Hour}
+	loginRate  = Rate{Limit: 10, Window: time.Minute}
+)
+
 type Deps struct {
-	Logger     *slog.Logger
-	DB         Pinger
-	Production bool
+	Logger         *slog.Logger
+	Checks         map[string]Pinger
+	Auth           Authenticator
+	Limiter        RateLimiter
+	TrustedProxies []netip.Prefix
+	SessionTTL     time.Duration
+	Production     bool
 }
 
 func NewHandler(d Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealth)
-	mux.HandleFunc("GET /readyz", handleReady(d.Logger, d.DB))
+	mux.HandleFunc("GET /readyz", handleReady(d.Logger, d.Checks))
+
+	a := &authHandler{
+		auth:       d.Auth,
+		logger:     d.Logger,
+		cookieName: sessionCookieName(d.Production),
+		ttl:        d.SessionTTL,
+	}
+	mux.HandleFunc("POST /v1/auth/signup", rateLimit(d.Limiter, d.Logger, "signup", signupRate, a.signup))
+	mux.HandleFunc("POST /v1/auth/login", rateLimit(d.Limiter, d.Logger, "login", loginRate, a.login))
+	mux.HandleFunc("POST /v1/auth/logout", a.logout)
+	mux.HandleFunc("GET /v1/auth/me", a.me)
 
 	var h http.Handler = mux
 	h = limitBody(maxBodyBytes, h)
@@ -31,6 +52,7 @@ func NewHandler(d Deps) http.Handler {
 	h = secureHeaders(d.Production, h)
 	h = recoverPanic(d.Logger, h)
 	h = logRequests(d.Logger, h)
+	h = clientInfo(d.TrustedProxies, h)
 	h = requestID(h)
 	return h
 }
@@ -39,15 +61,22 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func handleReady(logger *slog.Logger, db Pinger) http.HandlerFunc {
+func handleReady(logger *slog.Logger, checks map[string]Pinger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
-		if err := db.Ping(ctx); err != nil {
-			logger.WarnContext(r.Context(), "banco indisponível",
-				slog.String("request_id", RequestIDFrom(r.Context())),
-				slog.Any("error", err),
-			)
+		ready := true
+		for name, check := range checks {
+			if err := check.Ping(ctx); err != nil {
+				ready = false
+				logger.WarnContext(r.Context(), "dependência indisponível",
+					slog.String("request_id", RequestIDFrom(r.Context())),
+					slog.String("dependency", name),
+					slog.Any("error", err),
+				)
+			}
+		}
+		if !ready {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
 			return
 		}
@@ -62,5 +91,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int) {
-	writeJSON(w, status, map[string]string{"error": http.StatusText(status)})
+	writeErrorMessage(w, status, http.StatusText(status))
+}
+
+func writeErrorMessage(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
