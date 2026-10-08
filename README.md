@@ -135,10 +135,10 @@ O segredo aparece uma vez só. No banco fica apenas o SHA-256 dele, o que basta 
 
 ### Sessão de usuário
 
-O BFF precisa do escopo `session:exchange`. Ele pega o cookie de sessão que recebeu do navegador e manda o valor:
+O BFF precisa do escopo `session:exchange`. Ele pega o cookie de sessão que recebeu do navegador e manda o valor. Nos exemplos, `BFF_ID` e `BFF_SECRET` são o que o `client create` mostrou:
 
 ```bash
-curl -s localhost:8081/internal/v1/token -u 'cli_bff:<segredo>' \
+curl -s localhost:8081/internal/v1/token -u "$BFF_ID:$BFF_SECRET" \
   -H 'Content-Type: application/json' -d '{"session_token":"<valor do cookie>"}'
 ```
 
@@ -147,7 +147,7 @@ O token sai com `sub` igual ao id do usuário e `client_id` igual ao do BFF. Gua
 ### Serviço para serviço
 
 ```bash
-curl -s localhost:8081/internal/v1/oauth/token -u 'cli_pedidos:<segredo>' \
+curl -s localhost:8081/internal/v1/oauth/token -u "$PEDIDOS_ID:$PEDIDOS_SECRET" \
   -d grant_type=client_credentials -d 'scope=estoque:ler'
 ```
 
