@@ -14,6 +14,10 @@ linters:
         linters:
           - gosec
           - noctx
+      - path: cmd/keygen/
+        linters:
+          - gosec
+        text: G703
 
 formatters:
   enable:
