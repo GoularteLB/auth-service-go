@@ -14,5 +14,5 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ /app/
 
 USER nonroot:nonroot
-EXPOSE 8080
+EXPOSE 8080 8081
 ENTRYPOINT ["/app/auth"]

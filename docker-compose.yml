@@ -15,6 +15,21 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?defina REDIS_PASSWORD no arquivo .env}", "--appendonly", "yes"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   migrate:
     build: .
     entrypoint: ["/app/migrate", "up"]
@@ -30,11 +45,16 @@ services:
       AUTH_ENV: ${AUTH_ENV:-development}
       AUTH_LOG_LEVEL: ${AUTH_LOG_LEVEL:-info}
       AUTH_DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres:5432/auth?sslmode=disable
+      AUTH_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
     ports:
       - "127.0.0.1:${AUTH_PORT:-8080}:8080"
+      - "127.0.0.1:${AUTH_INTERNAL_PORT:-8081}:8081"
     depends_on:
+      redis:
+        condition: service_healthy
       migrate:
         condition: service_completed_successfully
 
 volumes:
   pgdata:
+  redisdata:
