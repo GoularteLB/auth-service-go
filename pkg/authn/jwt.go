@@ -12,6 +12,12 @@ import (
 )
 
 const (
+	AMRPassword = "pwd"
+	AMROTP      = "otp"
+	AMRMFA      = "mfa"
+)
+
+const (
 	algEdDSA     = "EdDSA"
 	typJWT       = "JWT"
 	maxTokenSize = 8 << 10
@@ -67,6 +73,35 @@ type Claims struct {
 	NotBefore int64    `json:"nbf"`
 	ExpiresAt int64    `json:"exp"`
 	ID        string   `json:"jti"`
+	ClientID  string   `json:"client_id,omitempty"`
+	Scope     string   `json:"scope,omitempty"`
+	AMR       []string `json:"amr,omitempty"`
+}
+
+func (c Claims) Scopes() []string {
+	return strings.Fields(c.Scope)
+}
+
+func (c Claims) HasScope(scope string) bool {
+	for _, s := range c.Scopes() {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Claims) HasAMR(method string) bool {
+	for _, m := range c.AMR {
+		if m == method {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Claims) IsService() bool {
+	return c.ClientID != "" && c.Subject == c.ClientID
 }
 
 type header struct {

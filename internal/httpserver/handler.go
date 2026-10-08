@@ -18,6 +18,12 @@ type Pinger interface {
 var (
 	signupRate = Rate{Limit: 10, Window: time.Hour}
 	loginRate  = Rate{Limit: 10, Window: time.Minute}
+	verifyRate = Rate{Limit: 20, Window: time.Hour}
+	resendRate = Rate{Limit: 5, Window: time.Hour}
+	forgotRate = Rate{Limit: 5, Window: time.Hour}
+	resetRate  = Rate{Limit: 10, Window: time.Hour}
+	mfaRate    = Rate{Limit: 10, Window: time.Minute}
+	manageRate = Rate{Limit: 20, Window: time.Hour}
 )
 
 type Deps struct {
@@ -39,12 +45,21 @@ func NewHandler(d Deps) http.Handler {
 		auth:       d.Auth,
 		logger:     d.Logger,
 		cookieName: sessionCookieName(d.Production),
+		mfaCookie:  mfaCookieName(d.Production),
 		ttl:        d.SessionTTL,
 	}
 	mux.HandleFunc("POST /v1/auth/signup", rateLimit(d.Limiter, d.Logger, "signup", signupRate, a.signup))
 	mux.HandleFunc("POST /v1/auth/login", rateLimit(d.Limiter, d.Logger, "login", loginRate, a.login))
 	mux.HandleFunc("POST /v1/auth/logout", a.logout)
 	mux.HandleFunc("GET /v1/auth/me", a.me)
+	mux.HandleFunc("POST /v1/auth/email/verify", rateLimit(d.Limiter, d.Logger, "verify", verifyRate, a.verifyEmail))
+	mux.HandleFunc("POST /v1/auth/email/resend", rateLimit(d.Limiter, d.Logger, "resend", resendRate, a.resendVerification))
+	mux.HandleFunc("POST /v1/auth/password/forgot", rateLimit(d.Limiter, d.Logger, "forgot", forgotRate, a.forgotPassword))
+	mux.HandleFunc("POST /v1/auth/password/reset", rateLimit(d.Limiter, d.Logger, "reset", resetRate, a.resetPassword))
+	mux.HandleFunc("POST /v1/auth/login/mfa", rateLimit(d.Limiter, d.Logger, "login_mfa", mfaRate, a.loginMFA))
+	mux.HandleFunc("POST /v1/auth/mfa/setup", rateLimit(d.Limiter, d.Logger, "mfa_manage", manageRate, a.setupMFA))
+	mux.HandleFunc("POST /v1/auth/mfa/enable", rateLimit(d.Limiter, d.Logger, "mfa_manage", manageRate, a.enableMFA))
+	mux.HandleFunc("POST /v1/auth/mfa/disable", rateLimit(d.Limiter, d.Logger, "mfa_manage", manageRate, a.disableMFA))
 
 	var h http.Handler = mux
 	h = limitBody(maxBodyBytes, h)

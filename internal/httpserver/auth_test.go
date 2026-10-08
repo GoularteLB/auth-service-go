@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/GoularteLB/auth-service/internal/auth"
+	"github.com/GoularteLB/auth-service/internal/mfa"
 	"github.com/GoularteLB/auth-service/internal/password"
 	"github.com/GoularteLB/auth-service/internal/user"
 )
@@ -58,6 +59,9 @@ func (f *fakeAuth) Login(_ context.Context, email, plain string) (string, error)
 	if f.locked > 0 {
 		return "", &auth.LockedError{RetryAfter: f.locked}
 	}
+	if email == "mfa@example.com" && plain == "uma-senha-bem-longa" {
+		return "", &auth.MFARequiredError{Challenge: "desafio-ok"}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if p, ok := f.users[email]; !ok || p != plain {
@@ -76,17 +80,26 @@ func (f *fakeAuth) Logout(_ context.Context, token string) error {
 	return nil
 }
 
-func (f *fakeAuth) Current(_ context.Context, token string) (user.User, error) {
+func (f *fakeAuth) Current(ctx context.Context, token string) (user.User, error) {
+	u, _, err := f.Identify(ctx, token)
+	return u, err
+}
+
+func (f *fakeAuth) Identify(_ context.Context, token string) (user.User, []string, error) {
 	if f.currentErr != nil {
-		return user.User{}, f.currentErr
+		return user.User{}, nil, f.currentErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	email, ok := f.sessions[token]
 	if !ok {
-		return user.User{}, auth.ErrUnauthenticated
+		return user.User{}, nil, auth.ErrUnauthenticated
 	}
-	return user.User{ID: "id-" + email, Email: email, PasswordHash: "nunca-expor"}, nil
+	amr := []string{"pwd"}
+	if email == "mfa@example.com" {
+		amr = []string{"pwd", "otp", "mfa"}
+	}
+	return user.User{ID: "id-" + email, Email: email, PasswordHash: "nunca-expor"}, amr, nil
 }
 
 type fakeLimiter struct {
@@ -110,6 +123,90 @@ func (f *fakeLimiter) Allow(_ context.Context, key string, limit int, window tim
 		return window, nil
 	}
 	return 0, nil
+}
+
+func (f *fakeAuth) VerifyEmail(_ context.Context, token string) error {
+	if token != "verifica-ok" {
+		return auth.ErrInvalidLink
+	}
+	return nil
+}
+
+func (f *fakeAuth) ResendVerification(ctx context.Context, sessionToken string) error {
+	_, err := f.Current(ctx, sessionToken)
+	return err
+}
+
+func (f *fakeAuth) ForgotPassword(_ context.Context, email string) error {
+	if !strings.Contains(email, "@") {
+		return auth.ErrInvalidEmail
+	}
+	return nil
+}
+
+func (f *fakeAuth) ResetPassword(_ context.Context, token, plain string) error {
+	if err := password.Validate(plain); err != nil {
+		return err
+	}
+	if token != "reset-ok" {
+		return auth.ErrInvalidLink
+	}
+	return nil
+}
+
+func (f *fakeAuth) LoginMFA(_ context.Context, challenge, code string) (string, error) {
+	if challenge != "desafio-ok" {
+		return "", auth.ErrMFAChallenge
+	}
+	if code != "123456" {
+		return "", auth.ErrInvalidMFACode
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seq++
+	token := "tok-mfa-" + strconv.Itoa(f.seq)
+	f.sessions[token] = "mfa@example.com"
+	return token, nil
+}
+
+func (f *fakeAuth) MFAEnabled(_ context.Context, userID string) (bool, error) {
+	return userID == "id-mfa@example.com", nil
+}
+
+func (f *fakeAuth) SetupMFA(ctx context.Context, session, plain string) (mfa.Setup, error) {
+	if _, err := f.Current(ctx, session); err != nil {
+		return mfa.Setup{}, err
+	}
+	if plain != "uma-senha-bem-longa" {
+		return mfa.Setup{}, auth.ErrInvalidCredentials
+	}
+	return mfa.Setup{Secret: "SEGREDO", URI: "otpauth://totp/x"}, nil
+}
+
+func (f *fakeAuth) EnableMFA(ctx context.Context, session, code string) ([]string, error) {
+	if _, err := f.Current(ctx, session); err != nil {
+		return nil, err
+	}
+	if code != "123456" {
+		return nil, auth.ErrInvalidMFACode
+	}
+	return []string{"aaaaa-bbbbb"}, nil
+}
+
+func (f *fakeAuth) DisableMFA(ctx context.Context, session, plain, code string) error {
+	if _, err := f.Current(ctx, session); err != nil {
+		return err
+	}
+	if plain != "uma-senha-bem-longa" {
+		return auth.ErrInvalidCredentials
+	}
+	if code == "nao-ativo" {
+		return auth.ErrMFANotEnabled
+	}
+	if code != "123456" {
+		return auth.ErrInvalidMFACode
+	}
+	return nil
 }
 
 func newAuthTestHandler(t *testing.T, a *fakeAuth, production bool) http.Handler {
@@ -396,5 +493,185 @@ func TestLockedLogin(t *testing.T) {
 	}
 	if len(rec.Result().Cookies()) != 0 {
 		t.Fatal("login bloqueado devolveu cookie")
+	}
+}
+
+func TestRecoveryEndpoints(t *testing.T) {
+	a := newFakeAuth()
+	session := loggedInSession(t, a)
+	h := newAuthTestHandler(t, a, false)
+
+	tests := []struct {
+		name, path, body string
+		cookie           bool
+		want             int
+	}{
+		{"verifica ok", "/v1/auth/email/verify", `{"token":"verifica-ok"}`, false, http.StatusNoContent},
+		{"verifica link ruim", "/v1/auth/email/verify", `{"token":"x"}`, false, http.StatusBadRequest},
+		{"reenvio sem sessão", "/v1/auth/email/resend", "", false, http.StatusUnauthorized},
+		{"reenvio com sessão", "/v1/auth/email/resend", "", true, http.StatusAccepted},
+		{"esqueci ok", "/v1/auth/password/forgot", `{"email":"qualquer@example.com"}`, false, http.StatusAccepted},
+		{"esqueci e-mail ruim", "/v1/auth/password/forgot", `{"email":"x"}`, false, http.StatusBadRequest},
+		{"esqueci campo extra", "/v1/auth/password/forgot", `{"email":"a@b.com","admin":true}`, false, http.StatusBadRequest},
+		{"redefine ok", "/v1/auth/password/reset", `{"token":"reset-ok","password":"uma-senha-nova-e-longa"}`, false, http.StatusNoContent},
+		{"redefine link ruim", "/v1/auth/password/reset", `{"token":"x","password":"uma-senha-nova-e-longa"}`, false, http.StatusBadRequest},
+		{"redefine senha curta", "/v1/auth/password/reset", `{"token":"reset-ok","password":"curta"}`, false, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := jsonRequest(http.MethodPost, tt.path, tt.body)
+			if tt.cookie {
+				req.AddCookie(&http.Cookie{Name: "session", Value: session})
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, esperado %d: %s", rec.Code, tt.want, rec.Body)
+			}
+		})
+	}
+}
+
+func TestResetClearsCookie(t *testing.T) {
+	req := jsonRequest(http.MethodPost, "/v1/auth/password/reset", `{"token":"reset-ok","password":"uma-senha-nova-e-longa"}`)
+	rec := httptest.NewRecorder()
+	newAuthTestHandler(t, newFakeAuth(), false).ServeHTTP(rec, req)
+	if c := sessionCookie(t, rec, "session"); c == nil || c.MaxAge >= 0 {
+		t.Fatal("redefinição não limpou o cookie de sessão")
+	}
+}
+
+func TestForgotPasswordRateLimited(t *testing.T) {
+	h := newAuthTestHandler(t, newFakeAuth(), false)
+	for range forgotRate.Limit {
+		h.ServeHTTP(httptest.NewRecorder(), jsonRequest(http.MethodPost, "/v1/auth/password/forgot", `{"email":"a@example.com"}`))
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, jsonRequest(http.MethodPost, "/v1/auth/password/forgot", `{"email":"a@example.com"}`))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, esperado 429", rec.Code)
+	}
+}
+
+func TestMeShowsEmailVerified(t *testing.T) {
+	a := newFakeAuth()
+	session := loggedInSession(t, a)
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: session})
+	rec := httptest.NewRecorder()
+	newAuthTestHandler(t, a, false).ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"email_verified":false`) {
+		t.Fatalf("/me sem email_verified: %s", rec.Body)
+	}
+}
+
+func TestLoginWithMFAOverHTTP(t *testing.T) {
+	a := newFakeAuth()
+	_ = a.Signup(context.Background(), "mfa@example.com", "uma-senha-bem-longa")
+	h := newAuthTestHandler(t, a, true)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, jsonRequest(http.MethodPost, "/v1/auth/login", `{"email":"mfa@example.com","password":"uma-senha-bem-longa"}`))
+	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"mfa_required":true`) {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	if sessionCookie(t, rec, "__Host-session") != nil {
+		t.Fatal("sessão criada antes do segundo fator")
+	}
+	challenge := sessionCookie(t, rec, "__Host-mfa")
+	if challenge == nil || !challenge.HttpOnly || !challenge.Secure || challenge.SameSite != http.SameSiteStrictMode || challenge.MaxAge != 300 {
+		t.Fatalf("cookie de desafio inseguro: %+v", challenge)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, jsonRequest(http.MethodPost, "/v1/auth/login/mfa", `{"code":"123456"}`))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("sem cookie de desafio: status = %d", rec.Code)
+	}
+
+	req := jsonRequest(http.MethodPost, "/v1/auth/login/mfa", `{"code":"000000"}`)
+	req.AddCookie(challenge)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || sessionCookie(t, rec, "__Host-session") != nil {
+		t.Fatalf("código errado: status = %d", rec.Code)
+	}
+
+	req = jsonRequest(http.MethodPost, "/v1/auth/login/mfa", `{"code":"123456"}`)
+	req.AddCookie(challenge)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("código certo: status = %d: %s", rec.Code, rec.Body)
+	}
+	if c := sessionCookie(t, rec, "__Host-session"); c == nil || c.Value == "" {
+		t.Fatal("sessão não foi criada")
+	}
+	if c := sessionCookie(t, rec, "__Host-mfa"); c == nil || c.MaxAge >= 0 {
+		t.Fatal("cookie de desafio não foi limpo")
+	}
+}
+
+func TestExpiredChallengeClearsCookie(t *testing.T) {
+	req := jsonRequest(http.MethodPost, "/v1/auth/login/mfa", `{"code":"123456"}`)
+	req.AddCookie(&http.Cookie{Name: "mfa", Value: "vencido"})
+	rec := httptest.NewRecorder()
+	newAuthTestHandler(t, newFakeAuth(), false).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if c := sessionCookie(t, rec, "mfa"); c == nil || c.MaxAge >= 0 {
+		t.Fatal("desafio vencido não limpou o cookie")
+	}
+}
+
+func TestMFAManagement(t *testing.T) {
+	a := newFakeAuth()
+	session := loggedInSession(t, a)
+	h := newAuthTestHandler(t, a, false)
+
+	tests := []struct {
+		name, path, body string
+		cookie           bool
+		want             int
+		contains         string
+	}{
+		{"setup sem sessão", "/v1/auth/mfa/setup", `{"password":"uma-senha-bem-longa"}`, false, http.StatusUnauthorized, ""},
+		{"setup senha errada", "/v1/auth/mfa/setup", `{"password":"errada"}`, true, http.StatusForbidden, ""},
+		{"setup ok", "/v1/auth/mfa/setup", `{"password":"uma-senha-bem-longa"}`, true, http.StatusOK, "otpauth_url"},
+		{"enable código errado", "/v1/auth/mfa/enable", `{"code":"000000"}`, true, http.StatusBadRequest, ""},
+		{"enable ok", "/v1/auth/mfa/enable", `{"code":"123456"}`, true, http.StatusOK, "recovery_codes"},
+		{"disable senha errada", "/v1/auth/mfa/disable", `{"password":"errada","code":"123456"}`, true, http.StatusForbidden, ""},
+		{"disable não ativo", "/v1/auth/mfa/disable", `{"password":"uma-senha-bem-longa","code":"nao-ativo"}`, true, http.StatusConflict, ""},
+		{"disable ok", "/v1/auth/mfa/disable", `{"password":"uma-senha-bem-longa","code":"123456"}`, true, http.StatusNoContent, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := jsonRequest(http.MethodPost, tt.path, tt.body)
+			if tt.cookie {
+				req.AddCookie(&http.Cookie{Name: "session", Value: session})
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, esperado %d: %s", rec.Code, tt.want, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tt.contains) {
+				t.Errorf("corpo sem %q: %s", tt.contains, rec.Body)
+			}
+		})
+	}
+}
+
+func TestMeShowsMFA(t *testing.T) {
+	a := newFakeAuth()
+	_ = a.Signup(context.Background(), "mfa@example.com", "uma-senha-bem-longa")
+	session, _ := a.LoginMFA(context.Background(), "desafio-ok", "123456")
+	req := httptest.NewRequest(http.MethodGet, "/v1/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: session})
+	rec := httptest.NewRecorder()
+	newAuthTestHandler(t, a, false).ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"mfa_enabled":true`) {
+		t.Fatalf("/me sem mfa_enabled: %s", rec.Body)
 	}
 }

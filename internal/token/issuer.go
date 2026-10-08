@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/GoularteLB/auth-service/pkg/authn"
@@ -43,7 +44,7 @@ func NewIssuer(key ed25519.PrivateKey, previous []ed25519.PublicKey, opts Option
 	return &Issuer{key: key, kid: authn.Thumbprint(pub), opts: opts, jwks: jwks, now: time.Now}
 }
 
-func (i *Issuer) Issue(subject string) (string, time.Duration, error) {
+func (i *Issuer) Issue(subject, clientID string, scopes, amr []string) (string, time.Duration, error) {
 	now := i.now().UTC()
 	token, err := authn.Sign(i.key, i.kid, authn.Claims{
 		Issuer:    i.opts.Issuer,
@@ -53,6 +54,9 @@ func (i *Issuer) Issue(subject string) (string, time.Duration, error) {
 		NotBefore: now.Unix(),
 		ExpiresAt: now.Add(i.opts.TTL).Unix(),
 		ID:        rand.Text(),
+		ClientID:  clientID,
+		Scope:     strings.Join(scopes, " "),
+		AMR:       amr,
 	})
 	if err != nil {
 		return "", 0, fmt.Errorf("assinando token: %w", err)

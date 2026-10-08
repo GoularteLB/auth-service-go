@@ -19,10 +19,15 @@ var (
 const uniqueViolation = "23505"
 
 type User struct {
-	ID           string
-	Email        string
-	PasswordHash string
-	CreatedAt    time.Time
+	ID              string
+	Email           string
+	PasswordHash    string
+	CreatedAt       time.Time
+	EmailVerifiedAt *time.Time
+}
+
+func (u User) EmailVerified() bool {
+	return u.EmailVerifiedAt != nil
 }
 
 type Store struct {
@@ -51,12 +56,12 @@ func (s *Store) Create(ctx context.Context, email, passwordHash string) (User, e
 
 func (s *Store) ByEmail(ctx context.Context, email string) (User, error) {
 	return s.one(ctx,
-		`SELECT id::text, email::text, password_hash, created_at FROM users WHERE email = $1`, email)
+		`SELECT id::text, email::text, password_hash, created_at, email_verified_at FROM users WHERE email = $1`, email)
 }
 
 func (s *Store) ByID(ctx context.Context, id string) (User, error) {
 	return s.one(ctx,
-		`SELECT id::text, email::text, password_hash, created_at FROM users WHERE id = $1::uuid`, id)
+		`SELECT id::text, email::text, password_hash, created_at, email_verified_at FROM users WHERE id = $1::uuid`, id)
 }
 
 func (s *Store) UpdatePasswordHash(ctx context.Context, id, passwordHash string) error {
@@ -68,9 +73,19 @@ func (s *Store) UpdatePasswordHash(ctx context.Context, id, passwordHash string)
 	return nil
 }
 
+func (s *Store) MarkEmailVerified(ctx context.Context, id string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE users SET email_verified_at = now(), updated_at = now()
+		 WHERE id = $1::uuid AND email_verified_at IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("marcando e-mail verificado: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) one(ctx context.Context, query string, arg string) (User, error) {
 	var u User
-	err := s.db.QueryRow(ctx, query, arg).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt)
+	err := s.db.QueryRow(ctx, query, arg).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.CreatedAt, &u.EmailVerifiedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return User{}, ErrNotFound
 	}

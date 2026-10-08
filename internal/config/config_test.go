@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"log/slog"
 	"strings"
 	"testing"
@@ -43,6 +44,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.JWT.TTL != 5*time.Minute || cfg.JWT.Issuer != "auth-service" || cfg.JWT.Audience != "internal" {
 		t.Errorf("JWT = %+v", cfg.JWT)
 	}
+	if cfg.PublicURL != "http://localhost:5173" || cfg.SMTPURL != "" || !strings.Contains(cfg.MailFrom, "@localhost") {
+		t.Errorf("e-mail em desenvolvimento: %q %q %q", cfg.PublicURL, cfg.SMTPURL, cfg.MailFrom)
+	}
 }
 
 func TestLoadErrors(t *testing.T) {
@@ -82,6 +86,17 @@ func TestLoadErrors(t *testing.T) {
 		{"jwt ttl curto demais", base(map[string]string{"AUTH_JWT_TTL": "10s"}), "AUTH_JWT_TTL"},
 		{"listeners iguais", base(map[string]string{"AUTH_INTERNAL_ADDR": ":8080"}), "AUTH_INTERNAL_ADDR"},
 		{"listener interno inválido", base(map[string]string{"AUTH_INTERNAL_ADDR": "8081"}), "AUTH_INTERNAL_ADDR"},
+		{"public url sem esquema", base(map[string]string{"AUTH_PUBLIC_URL": "app.example.com"}), "AUTH_PUBLIC_URL"},
+		{"public url com fragmento", base(map[string]string{"AUTH_PUBLIC_URL": "https://app.example.com/#x"}), "AUTH_PUBLIC_URL"},
+		{"produção sem public url", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_PUBLIC_URL"},
+		{"produção public url http", base(map[string]string{"AUTH_ENV": "production", "AUTH_PUBLIC_URL": "http://app.example.com"}), "https://"},
+		{"produção sem smtp", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_SMTP_URL"},
+		{"produção sem remetente", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_MAIL_FROM"},
+		{"smtp esquema errado", base(map[string]string{"AUTH_SMTP_URL": "http://mail:25"}), "AUTH_SMTP_URL"},
+		{"remetente inválido", base(map[string]string{"AUTH_MAIL_FROM": "sem arroba"}), "AUTH_MAIL_FROM"},
+		{"produção sem chave mfa", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_MFA_KEY"},
+		{"chave mfa curta", base(map[string]string{"AUTH_MFA_KEY": "c2hvcnQ="}), "AUTH_MFA_KEY"},
+		{"chave mfa fora de base64", base(map[string]string{"AUTH_MFA_KEY": "isso não é base64"}), "AUTH_MFA_KEY"},
 		{"produção sem chave jwt", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_JWT_KEY_FILE"},
 		{"proxy inválido", base(map[string]string{"AUTH_TRUSTED_PROXIES": "10.0.0.0/8, nao-e-ip"}), "AUTH_TRUSTED_PROXIES"},
 		{"ttl longo demais", base(map[string]string{"AUTH_SESSION_TTL": "1000h"}), "AUTH_SESSION_TTL"},
@@ -118,6 +133,10 @@ func TestProductionWithTLS(t *testing.T) {
 		"AUTH_DATABASE_URL": "postgres://auth:secret@db:5432/auth?sslmode=verify-full",
 		"AUTH_REDIS_URL":    "rediss://:secret@cache:6380/0",
 		"AUTH_JWT_KEY_FILE": "/run/secrets/jwt.pem",
+		"AUTH_PUBLIC_URL":   "https://app.example.com/",
+		"AUTH_SMTP_URL":     "smtp://user:pw@smtp.example.com:587",
+		"AUTH_MAIL_FROM":    "Exemplo <no-reply@example.com>",
+		"AUTH_MFA_KEY":      base64.StdEncoding.EncodeToString(make([]byte, 32)),
 	}))
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
@@ -187,5 +206,13 @@ func TestLoadDatabaseURLIgnoresOtherSettings(t *testing.T) {
 		"AUTH_DATABASE_URL": "postgres://auth:secret@db:5432/auth?sslmode=disable",
 	})); err == nil {
 		t.Fatal("migrate em produção aceitou banco sem tls")
+	}
+}
+
+func TestLogValueHidesMFAKey(t *testing.T) {
+	cfg := Config{MFAKey: []byte("0123456789abcdef0123456789abcdef")}
+	out := cfg.LogValue().String()
+	if strings.Contains(out, "0123456789abcdef") {
+		t.Fatalf("chave de mfa vazou no log: %s", out)
 	}
 }

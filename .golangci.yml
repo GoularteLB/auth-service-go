@@ -18,6 +18,10 @@ linters:
         linters:
           - gosec
         text: G703
+      - path: internal/mfa/totp\.go
+        linters:
+          - gosec
+        text: G505
 
 formatters:
   enable:

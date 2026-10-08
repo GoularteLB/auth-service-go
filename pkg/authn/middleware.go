@@ -33,6 +33,39 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+func RequireScope(scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, ok := ClaimsFrom(r.Context())
+		if !ok {
+			unauthorized(w, "")
+			return
+		}
+		if !c.HasScope(scope) {
+			w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="`+scope+`"`)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"escopo insuficiente"}` + "\n"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func RequireMFA(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, ok := ClaimsFrom(r.Context())
+		if !ok {
+			unauthorized(w, "")
+			return
+		}
+		if !c.HasAMR(AMRMFA) {
+			unauthorized(w, "insufficient_user_authentication")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func bearer(h string) (string, bool) {
 	scheme, token, ok := strings.Cut(h, " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {

@@ -20,7 +20,7 @@ func TestIssueVerifiesAgainstOwnJWKS(t *testing.T) {
 	}
 	iss := NewIssuer(key, nil, opts)
 
-	tok, ttl, err := iss.Issue("user-1")
+	tok, ttl, err := iss.Issue("user-1", "cli_bff", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestIssueVerifiesAgainstOwnJWKS(t *testing.T) {
 		t.Errorf("claims inesperadas: %+v", c)
 	}
 
-	other, _, _ := iss.Issue("user-1")
+	other, _, _ := iss.Issue("user-1", "cli_bff", nil, nil)
 	if other == tok {
 		t.Error("dois tokens iguais, jti não está variando")
 	}

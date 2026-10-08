@@ -12,9 +12,10 @@ O projeto está sendo construído em fases curtas. Cada fase só começa quando 
 - [x] **Fase 2:** cadastro e login com Argon2id, anti-enumeração, sessões no Redis
 - [x] **Fase 3:** rate limit, bloqueio progressivo e log de auditoria
 - [x] **Fase 4:** JWT interno, JWKS e middleware para os microsserviços
-- [ ] **Fase 5:** client credentials
-- [ ] **Fase 6:** verificação de e-mail e redefinição de senha
-- [ ] **Depois:** MFA (TOTP), pentest e lançamento
+- [x] **Fase 5:** client credentials
+- [x] **Fase 6:** verificação de e-mail e redefinição de senha
+- [x] **Fase 7:** MFA com TOTP e códigos de recuperação
+- [ ] **Antes de lançar:** pentest externo e o [checklist de lançamento](#antes-de-lançar)
 
 ## Rodando
 
@@ -49,7 +50,15 @@ go run ./cmd/auth
 | `POST /v1/auth/signup` | cria a conta e responde `202`, mesmo se o e-mail já existir |
 | `POST /v1/auth/login` | responde `204` com o cookie de sessão, ou `401` |
 | `POST /v1/auth/logout` | apaga a sessão e o cookie |
-| `GET /v1/auth/me` | dados do usuário logado |
+| `POST /v1/auth/login/mfa` | `{"code"}` segunda etapa do login quando o MFA está ativo |
+| `GET /v1/auth/me` | dados do usuário logado, incluindo `email_verified` e `mfa_enabled` |
+| `POST /v1/auth/email/verify` | `{"token"}` confirma o e-mail |
+| `POST /v1/auth/email/resend` | manda outro link de confirmação para quem está logado |
+| `POST /v1/auth/password/forgot` | `{"email"}` responde `202` sempre, exista a conta ou não |
+| `POST /v1/auth/password/reset` | `{"token", "password"}` troca a senha |
+| `POST /v1/auth/mfa/setup` | `{"password"}` gera o segredo e a URL `otpauth://` para o QR code |
+| `POST /v1/auth/mfa/enable` | `{"code"}` confirma o primeiro código e devolve os códigos de recuperação |
+| `POST /v1/auth/mfa/disable` | `{"password", "code"}` desliga o MFA |
 
 O corpo de cadastro e login é `{"email": "...", "password": "..."}` com `Content-Type: application/json`. A senha precisa ter entre 12 e 128 caracteres.
 
@@ -61,6 +70,42 @@ curl -i -b cookies.txt localhost:8080/v1/auth/me
 
 O cookie é `HttpOnly`, `Secure` e `SameSite=Strict`, e em produção usa o prefixo `__Host-`. O Redis guarda só o SHA-256 do token, então um dump do Redis não serve para sequestrar sessão.
 
+## E-mail e senha esquecida
+
+O cadastro manda um link de confirmação. Se o e-mail já tinha conta, o dono recebe um aviso de "você já tem conta" no lugar, e quem cadastrou não percebe diferença nenhuma.
+
+Os links apontam para a SPA em `AUTH_PUBLIC_URL`:
+
+- `/verificar-email#token=...` vale por 24 horas
+- `/redefinir-senha#token=...` vale por 30 minutos
+
+O token vai depois do `#` de propósito. O navegador não manda essa parte para servidor nenhum, então ela não aparece em log de proxy nem vaza no `Referer`. A SPA lê o token de `location.hash` e faz o POST.
+
+Os links são de uso único, e pedir um novo invalida o anterior. Redefinir a senha derruba todas as sessões abertas, libera um bloqueio por senha errada, marca o e-mail como confirmado e manda um aviso de "sua senha foi alterada".
+
+Os e-mails saem por uma fila em segundo plano. Assim o "esqueci a senha" responde no mesmo tempo com ou sem conta, e o tempo de resposta não entrega quais e-mails estão cadastrados. Por enquanto o login não exige e-mail confirmado. A SPA decide o que fazer com `email_verified`.
+
+Em desenvolvimento, o compose sobe o [Mailpit](https://mailpit.axllent.org): todo e-mail cai em `http://localhost:8025`. Fora do Docker e sem `AUTH_SMTP_URL`, os e-mails vão para o log. Em produção o SMTP é obrigatório e precisa de TLS, seja `smtps://` ou STARTTLS.
+
+## Verificação em duas etapas
+
+O usuário logado chama `mfa/setup` com a senha atual. A resposta traz o segredo e uma URL `otpauth://`, que a SPA mostra como QR code. Ele escaneia no autenticador, manda o primeiro código em `mfa/enable` e recebe 10 códigos de recuperação. Esses códigos aparecem uma única vez.
+
+Com o MFA ativo, o login muda:
+
+1. `POST /v1/auth/login` com a senha certa responde `202 {"mfa_required": true}` e um cookie `mfa` de 5 minutos, sem sessão ainda.
+2. `POST /v1/auth/login/mfa` com o código do app, ou com um código de recuperação, cria a sessão.
+
+Detalhes que importam:
+
+- Ligar e desligar pedem a senha. Assim, uma sessão roubada não basta para trancar o dono fora da conta.
+- Um código só vale uma vez, mesmo dentro da janela de 30 segundos. O mesmo vale para cada código de recuperação.
+- Código errado conta para um bloqueio progressivo próprio, separado do bloqueio de senha.
+- Redefinir a senha pelo e-mail **não** desliga o MFA. Quem tomar a caixa de e-mail continua precisando do segundo fator.
+- O segredo fica cifrado no banco com AES-256-GCM, usando `AUTH_MFA_KEY`. Um dump do banco sem a chave não revela nenhum segredo.
+
+Gere a chave com `openssl rand -base64 32`. Em desenvolvimento, sem ela, o serviço usa uma chave temporária e avisa no log: quem ativar MFA perde o acesso quando o serviço reinicia. Trocar a chave em produção invalida todos os MFAs ativos, então guarde-a como guarda a chave do JWT.
+
 ## Tokens para os microsserviços
 
 O serviço escuta em duas portas. A `8080` é pública e atende a SPA. A `8081` é interna e não deve ser exposta para fora da rede dos serviços:
@@ -68,18 +113,59 @@ O serviço escuta em duas portas. A `8080` é pública e atende a SPA. A `8081` 
 | Rota interna | |
 |---|---|
 | `GET /.well-known/jwks.json` | chaves públicas para validar os tokens |
-| `POST /internal/v1/token` | troca uma sessão por um JWT de 5 minutos |
+| `POST /internal/v1/token` | o BFF troca uma sessão de usuário por um JWT |
+| `POST /internal/v1/oauth/token` | um serviço pede um JWT para ele mesmo (client credentials) |
 
-O BFF pega o cookie de sessão que recebeu do navegador e manda o valor:
+Nenhuma das duas rotas de token é aberta: quem chama precisa ser um cliente cadastrado, autenticado com HTTP Basic (`client_id:client_secret`).
+
+### Clientes
+
+Cada serviço que fala com o auth-service é um cliente com escopos. Para cadastrar, use a CLI:
 
 ```bash
-curl -s localhost:8081/internal/v1/token -H 'Content-Type: application/json' \
-  -d '{"session_token":"<valor do cookie>"}'
+go run ./cmd/client create bff session:exchange
+go run ./cmd/client create pedidos estoque:ler estoque:escrever
+go run ./cmd/client list
+go run ./cmd/client revoke cli_xxxxx
 ```
 
-A resposta traz `access_token`, `token_type` e `expires_in`. O token é assinado com Ed25519 (`alg: EdDSA`) e leva `iss`, `sub` (id do usuário), `aud`, `iat`, `nbf`, `exp` e `jti`. O `kid` é o thumbprint da chave (RFC 7638).
+No Docker é o mesmo binário: `docker compose run --rm --entrypoint /app/client auth create bff session:exchange`.
 
-Por enquanto quem protege a troca é a rede: qualquer um que alcance a `8081` com uma sessão válida consegue um token. A Fase 5 coloca client credentials na frente disso.
+O segredo aparece uma vez só. No banco fica apenas o SHA-256 dele, o que basta porque o segredo é aleatório e longo, sem o custo de um Argon2 a cada chamada. Revogar corta novas emissões na hora. Os tokens já emitidos continuam valendo até expirar, no máximo `AUTH_JWT_TTL`.
+
+### Sessão de usuário
+
+O BFF precisa do escopo `session:exchange`. Ele pega o cookie de sessão que recebeu do navegador e manda o valor:
+
+```bash
+curl -s localhost:8081/internal/v1/token -u 'cli_bff:<segredo>' \
+  -H 'Content-Type: application/json' -d '{"session_token":"<valor do cookie>"}'
+```
+
+O token sai com `sub` igual ao id do usuário e `client_id` igual ao do BFF. Guarde o JWT por sessão e só troque de novo perto de expirar: a rota aceita até 3000 trocas por minuto por IP.
+
+### Serviço para serviço
+
+```bash
+curl -s localhost:8081/internal/v1/oauth/token -u 'cli_pedidos:<segredo>' \
+  -d grant_type=client_credentials -d 'scope=estoque:ler'
+```
+
+Sem `scope`, o token vem com todos os escopos do cliente. Pedir um escopo que o cliente não tem dá `invalid_scope`. Aqui `sub` e `client_id` são o próprio cliente. Os erros seguem a RFC 6749 (`invalid_client`, `invalid_scope`, `unsupported_grant_type`), e o segredo só é aceito no header, nunca no corpo.
+
+### Formato do token
+
+Assinado com Ed25519 (`alg: EdDSA`), com `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `client_id` e, quando houver, `scope`. O `kid` é o thumbprint da chave (RFC 7638).
+
+Token de usuário também traz `amr`, dizendo como a sessão foi aberta (RFC 8176):
+
+| `amr` | |
+|---|---|
+| `["pwd"]` | só senha |
+| `["pwd", "otp", "mfa"]` | senha e código do autenticador |
+| `["pwd", "mfa"]` | senha e código de recuperação |
+
+O `amr` é da sessão, não do usuário. Quem liga o MFA continua com a sessão aberta só com senha até fazer login de novo.
 
 ### Validando nos microsserviços
 
@@ -97,9 +183,11 @@ verifier := &authn.Verifier{
 	Leeway:   30 * time.Second,
 }
 mux.Handle("GET /pedidos", verifier.Middleware(pedidos))
+mux.Handle("POST /estoque/baixa", verifier.Middleware(authn.RequireScope("estoque:escrever", baixa)))
+mux.Handle("POST /conta/pix", verifier.Middleware(authn.RequireMFA(pix)))
 ```
 
-Dentro do handler, `authn.ClaimsFrom(r.Context())` devolve as claims. As chaves ficam em cache por 10 minutos. Um `kid` desconhecido força uma nova busca, mas no máximo uma a cada 30 segundos, para um token inventado não virar enxurrada de requisições no JWKS. Se o JWKS cair, as chaves que já estão em cache continuam valendo.
+Dentro do handler, `authn.ClaimsFrom(r.Context())` devolve as claims. `claims.IsService()` diz se quem chamou foi um serviço ou um usuário via BFF, e `RequireScope` responde `403` com `insufficient_scope` quando falta permissão. Para uma rota que exige MFA, use `authn.RequireMFA`: sem `mfa` no `amr`, ela responde `401` com `insufficient_user_authentication` (RFC 9470), e a SPA pode pedir para o usuário entrar de novo com o segundo fator. Token de serviço nunca passa por ela. As chaves ficam em cache por 10 minutos. Um `kid` desconhecido força uma nova busca, mas no máximo uma a cada 30 segundos, para um token inventado não virar enxurrada de requisições no JWKS. Se o JWKS cair, as chaves que já estão em cache continuam valendo.
 
 ### Chaves e rotação
 
@@ -142,6 +230,11 @@ Cadastro, cadastro duplicado, login certo, login errado, login bloqueado e logou
 | `AUTH_JWT_ISSUER` | `auth-service` | |
 | `AUTH_JWT_AUDIENCE` | `internal` | |
 | `AUTH_JWT_TTL` | `5m` | entre `1m` e `15m` |
+| `AUTH_PUBLIC_URL` | `http://localhost:5173` | endereço da SPA usado nos links, obrigatório e `https` em produção |
+| `AUTH_SMTP_URL` | vazio | `smtp://user:senha@host:587` ou `smtps://...:465`, obrigatório em produção |
+| `AUTH_MAIL_FROM` | `auth-service <no-reply@localhost>` | remetente, obrigatório em produção |
+| `AUTH_MFA_KEY` | vazio | 32 bytes em base64 para cifrar os segredos de MFA, obrigatória em produção |
+| `AUTH_MFA_ISSUER` | `auth-service` | nome que aparece no app autenticador |
 | `AUTH_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `AUTH_SHUTDOWN_TIMEOUT` | `15s` | até `1m` |
 
@@ -155,7 +248,43 @@ golangci-lint run
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
 
-O CI roda isso tudo, além do gitleaks para pegar segredo commitado por engano.
+Os testes dos repositórios Postgres ficam em `internal/integration` e só rodam com `AUTH_TEST_DATABASE_URL` definida. Eles apagam as tabelas, então use um banco separado, nunca o de desenvolvimento:
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres createdb -U auth auth_test
+AUTH_TEST_DATABASE_URL="postgres://auth:<senha>@localhost:5432/auth_test?sslmode=disable" go test -v ./internal/integration/
+```
+
+O CI roda tudo isso, inclusive a integração com um Postgres de serviço, além do gitleaks para pegar segredo commitado por engano.
+
+## Antes de lançar
+
+O código está pronto, mas lançar depende de coisas que não moram no repositório.
+
+**Infra**
+- [ ] TLS terminando no proxy, com o IP dele em `AUTH_TRUSTED_PROXIES`
+- [ ] Porta `8081` alcançável só pela rede interna (network policy ou security group), nunca pela internet
+- [ ] Postgres com `sslmode=verify-full`, backup automático e restauração testada
+- [ ] Redis com `rediss://`, AOF ligado e `maxmemory-policy noeviction`. Se o Redis despejar chaves sob pressão, somem sessões e, pior, os contadores de bloqueio
+- [ ] Migrations rodando antes do deploy (`/app/migrate up`)
+
+**Segredos**
+- [ ] `AUTH_JWT_KEY_FILE`, `AUTH_MFA_KEY` e a senha do SMTP num cofre, não em variável solta
+- [ ] Backup da `AUTH_MFA_KEY`. Perder essa chave tranca todo mundo que usa MFA
+- [ ] Cliente do BFF criado em produção (`client create bff session:exchange`)
+
+**E-mail**
+- [ ] SPF, DKIM e DMARC no domínio do `AUTH_MAIL_FROM`. Sem eles os links caem no spam
+- [ ] SPA com as rotas `/verificar-email`, `/redefinir-senha` e `/esqueci-a-senha` lendo o token do `#`
+
+**Operação**
+- [ ] Alertas para picos de `login.failed`, `login.mfa_failed`, `client.auth_failed` e para o log "rate limit excedido"
+- [ ] Prazo de retenção da `audit_events` definido (ela guarda e-mail e IP, então entra na LGPD) e um job de limpeza
+- [ ] CI verde, incluindo `-race` e integração
+
+**Pentest**
+- [ ] Teste externo cobrindo as rotas públicas, a troca de sessão por token, o client credentials e o login com MFA
 
 ## Segurança
 

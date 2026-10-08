@@ -327,3 +327,95 @@ func TestMiddleware(t *testing.T) {
 		})
 	}
 }
+
+func TestScopes(t *testing.T) {
+	c := Claims{Subject: "cli_x", ClientID: "cli_x", Scope: "pedidos:ler  pedidos:escrever"}
+	if !c.HasScope("pedidos:ler") || !c.HasScope("pedidos:escrever") || c.HasScope("pedidos") {
+		t.Errorf("HasScope errado para %q", c.Scope)
+	}
+	if !c.IsService() {
+		t.Error("token de cliente deveria ser serviço")
+	}
+	if (Claims{Subject: "user-1", ClientID: "cli_bff"}).IsService() {
+		t.Error("token de usuário marcado como serviço")
+	}
+}
+
+func TestRequireScope(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	h := RequireScope("pedidos:ler", ok)
+
+	tests := []struct {
+		name   string
+		claims *Claims
+		want   int
+	}{
+		{"sem claims", nil, http.StatusUnauthorized},
+		{"sem escopo", &Claims{Scope: "outro"}, http.StatusForbidden},
+		{"com escopo", &Claims{Scope: "outro pedidos:ler"}, http.StatusNoContent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.claims != nil {
+				req = req.WithContext(WithClaims(req.Context(), *tt.claims))
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, esperado %d", rec.Code, tt.want)
+			}
+		})
+	}
+}
+
+func TestRequireMFA(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	h := RequireMFA(ok)
+
+	tests := []struct {
+		name      string
+		claims    *Claims
+		want      int
+		challenge string
+	}{
+		{"sem claims", nil, http.StatusUnauthorized, "Bearer"},
+		{"só senha", &Claims{Subject: "user-1", AMR: []string{AMRPassword}}, http.StatusUnauthorized, `Bearer error="insufficient_user_authentication"`},
+		{"serviço", &Claims{Subject: "cli_x", ClientID: "cli_x"}, http.StatusUnauthorized, `Bearer error="insufficient_user_authentication"`},
+		{"com mfa", &Claims{Subject: "user-1", AMR: []string{AMRPassword, AMROTP, AMRMFA}}, http.StatusNoContent, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.claims != nil {
+				req = req.WithContext(WithClaims(req.Context(), *tt.claims))
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tt.want {
+				t.Fatalf("status = %d, esperado %d", rec.Code, tt.want)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got != tt.challenge {
+				t.Errorf("WWW-Authenticate = %q, esperado %q", got, tt.challenge)
+			}
+		})
+	}
+}
+
+func TestAMRRoundTrip(t *testing.T) {
+	pub, priv := newKey(t)
+	kid := Thumbprint(pub)
+	c := validClaims()
+	c.AMR = []string{AMRPassword, AMRMFA}
+	token, err := Sign(priv, kid, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := newVerifier(StaticKeys{kid: pub}, epoch).Verify(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasAMR(AMRMFA) || got.HasAMR(AMROTP) {
+		t.Errorf("amr = %v", got.AMR)
+	}
+}

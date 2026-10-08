@@ -1,10 +1,12 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/mail"
 	"net/netip"
 	"net/url"
 	"os"
@@ -31,6 +33,11 @@ type Config struct {
 	SessionTTL      time.Duration
 	TrustedProxies  []netip.Prefix
 	JWT             JWT
+	PublicURL       string
+	SMTPURL         string
+	MailFrom        string
+	MFAKey          []byte
+	MFAIssuer       string
 }
 
 type JWT struct {
@@ -56,6 +63,11 @@ func (c Config) LogValue() slog.Value {
 		slog.Duration("shutdown_timeout", c.ShutdownTimeout),
 		slog.Duration("session_ttl", c.SessionTTL),
 		slog.Any("trusted_proxies", c.TrustedProxies),
+		slog.String("public_url", c.PublicURL),
+		slog.String("smtp_url", redactURL(c.SMTPURL)),
+		slog.String("mail_from", c.MailFrom),
+		slog.Bool("mfa_key_set", len(c.MFAKey) > 0),
+		slog.String("mfa_issuer", c.MFAIssuer),
 		slog.Group("jwt",
 			slog.String("key_file", c.JWT.KeyFile),
 			slog.Int("previous_keys", len(c.JWT.PreviousKeyFiles)),
@@ -102,6 +114,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		InternalAddr: get("AUTH_INTERNAL_ADDR", ":8081"),
 		DatabaseURL:  get("AUTH_DATABASE_URL", ""),
 		RedisURL:     get("AUTH_REDIS_URL", ""),
+		SMTPURL:      get("AUTH_SMTP_URL", ""),
 		JWT: JWT{
 			KeyFile:          get("AUTH_JWT_KEY_FILE", ""),
 			PreviousKeyFiles: splitList(get("AUTH_JWT_PREVIOUS_KEY_FILES", "")),
@@ -136,6 +149,37 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 
 	if cfg.Env == Production && cfg.JWT.KeyFile == "" {
 		errs = append(errs, errors.New("em produção AUTH_JWT_KEY_FILE é obrigatório"))
+	}
+
+	devURL, devFrom := "http://localhost:5173", "auth-service <no-reply@localhost>"
+	if cfg.Env == Production {
+		devURL, devFrom = "", ""
+	}
+	cfg.PublicURL = strings.TrimRight(get("AUTH_PUBLIC_URL", devURL), "/")
+	if err := validatePublicURL(cfg.PublicURL, cfg.Env); err != nil {
+		errs = append(errs, err)
+	}
+
+	cfg.MailFrom = get("AUTH_MAIL_FROM", devFrom)
+	if addr, err := mail.ParseAddress(cfg.MailFrom); err != nil || !strings.Contains(addr.Address, "@") {
+		errs = append(errs, errors.New("AUTH_MAIL_FROM precisa ser um endereço como \"Nome <no-reply@dominio>\""))
+	}
+
+	if err := validateSMTPURL(cfg.SMTPURL, cfg.Env); err != nil {
+		errs = append(errs, err)
+	}
+
+	cfg.MFAIssuer = get("AUTH_MFA_ISSUER", "auth-service")
+	switch raw := get("AUTH_MFA_KEY", ""); {
+	case raw == "" && cfg.Env == Production:
+		errs = append(errs, errors.New("em produção AUTH_MFA_KEY é obrigatório"))
+	case raw != "":
+		key, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(key) != 32 {
+			errs = append(errs, errors.New("AUTH_MFA_KEY precisa ser 32 bytes em base64 (openssl rand -base64 32)"))
+		} else {
+			cfg.MFAKey = key
+		}
 	}
 
 	if err := cfg.LogLevel.UnmarshalText([]byte(get("AUTH_LOG_LEVEL", "info"))); err != nil {
@@ -221,6 +265,40 @@ func validateRedisURL(raw string, env Environment) error {
 	}
 	if env == Production && u.Scheme != "rediss" {
 		return errors.New("em produção AUTH_REDIS_URL precisa usar rediss://")
+	}
+	return nil
+}
+
+func validatePublicURL(raw string, env Environment) error {
+	if raw == "" {
+		return errors.New("AUTH_PUBLIC_URL é obrigatório em produção")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return errors.New("AUTH_PUBLIC_URL precisa ser algo como https://app.exemplo.com")
+	}
+	if env == Production && u.Scheme != "https" {
+		return errors.New("em produção AUTH_PUBLIC_URL precisa usar https://")
+	}
+	return nil
+}
+
+func validateSMTPURL(raw string, env Environment) error {
+	if raw == "" {
+		if env == Production {
+			return errors.New("em produção AUTH_SMTP_URL é obrigatório")
+		}
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("AUTH_SMTP_URL não é uma URL válida")
+	}
+	if u.Scheme != "smtp" && u.Scheme != "smtps" {
+		return fmt.Errorf("AUTH_SMTP_URL deve usar smtp:// ou smtps://, recebido %q", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return errors.New("AUTH_SMTP_URL precisa de host")
 	}
 	return nil
 }

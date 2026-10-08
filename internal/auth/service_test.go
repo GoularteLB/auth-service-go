@@ -11,7 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/GoularteLB/auth-service/internal/audit"
+	"github.com/GoularteLB/auth-service/internal/mail"
+	"github.com/GoularteLB/auth-service/internal/mfa"
+	"github.com/GoularteLB/auth-service/internal/onetime"
 	"github.com/GoularteLB/auth-service/internal/password"
 	"github.com/GoularteLB/auth-service/internal/session"
 	"github.com/GoularteLB/auth-service/internal/user"
@@ -60,6 +66,19 @@ func (f *fakeUsers) ByID(_ context.Context, id string) (user.User, error) {
 	return user.User{}, user.ErrNotFound
 }
 
+func (f *fakeUsers) MarkEmailVerified(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for email, u := range f.byEmail {
+		if u.ID == id && u.EmailVerifiedAt == nil {
+			now := time.Now()
+			u.EmailVerifiedAt = &now
+			f.byEmail[email] = u
+		}
+	}
+	return nil
+}
+
 func (f *fakeUsers) UpdatePasswordHash(_ context.Context, id, hash string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -82,11 +101,11 @@ func newFakeSessions() *fakeSessions {
 	return &fakeSessions{data: map[string]session.Session{}}
 }
 
-func (f *fakeSessions) Create(_ context.Context, userID string) (string, error) {
+func (f *fakeSessions) Create(_ context.Context, userID string, amr []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	token := "tok-" + strconv.Itoa(len(f.data)+1)
-	f.data[token] = session.Session{UserID: userID, CreatedAt: time.Now()}
+	f.data[token] = session.Session{UserID: userID, AMR: amr, CreatedAt: time.Now()}
 	return token, nil
 }
 
@@ -105,6 +124,129 @@ func (f *fakeSessions) Delete(_ context.Context, token string) error {
 	defer f.mu.Unlock()
 	delete(f.data, token)
 	return nil
+}
+
+func (f *fakeSessions) DeleteAll(_ context.Context, userID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for token, s := range f.data {
+		if s.UserID == userID {
+			delete(f.data, token)
+		}
+	}
+	return nil
+}
+
+type fakeMailer struct {
+	mu   sync.Mutex
+	sent []mail.Message
+	err  error
+}
+
+func (f *fakeMailer) Send(_ context.Context, m mail.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.sent = append(f.sent, m)
+	return nil
+}
+
+func (f *fakeMailer) last(t *testing.T) mail.Message {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.sent) == 0 {
+		t.Fatal("nenhum e-mail enviado")
+	}
+	return f.sent[len(f.sent)-1]
+}
+
+func (f *fakeMailer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent)
+}
+
+type fakeMFA struct {
+	mu       sync.Mutex
+	enabled  map[string]bool
+	pending  map[string]bool
+	used     map[string]bool
+	recovery map[string]string
+}
+
+func newFakeMFA() *fakeMFA {
+	return &fakeMFA{
+		enabled:  map[string]bool{},
+		pending:  map[string]bool{},
+		used:     map[string]bool{},
+		recovery: map[string]string{},
+	}
+}
+
+func (f *fakeMFA) Enabled(_ context.Context, userID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enabled[userID], nil
+}
+
+func (f *fakeMFA) Setup(_ context.Context, userID, account string) (mfa.Setup, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.enabled[userID] {
+		return mfa.Setup{}, mfa.ErrAlreadyEnabled
+	}
+	f.pending[userID] = true
+	return mfa.Setup{Secret: "SEGREDO", URI: "otpauth://totp/x:" + account}, nil
+}
+
+func (f *fakeMFA) Enable(_ context.Context, userID, code string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.pending[userID] {
+		return nil, mfa.ErrNoPendingSetup
+	}
+	if code != "111111" {
+		return nil, mfa.ErrInvalidCode
+	}
+	f.enabled[userID] = true
+	f.recovery[userID] = "aaaaa-bbbbb"
+	return []string{"aaaaa-bbbbb"}, nil
+}
+
+func (f *fakeMFA) Verify(_ context.Context, userID, code string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.enabled[userID] {
+		return false, mfa.ErrNotEnabled
+	}
+	if code == f.recovery[userID] && !f.used[code] {
+		f.used[code] = true
+		return true, nil
+	}
+	if strings.HasPrefix(code, "22") && len(code) == 6 && !f.used[code] {
+		f.used[code] = true
+		return false, nil
+	}
+	return false, mfa.ErrInvalidCode
+}
+
+func (f *fakeMFA) Disable(_ context.Context, userID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.enabled, userID)
+	delete(f.pending, userID)
+	return nil
+}
+
+func newTokenStore(t *testing.T) *onetime.Store {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	return onetime.NewStore(rdb)
 }
 
 type fakeLockout struct {
@@ -173,6 +315,8 @@ type testEnv struct {
 	sessions *fakeSessions
 	lockout  *fakeLockout
 	audit    *fakeAudit
+	mailer   *fakeMailer
+	mfa      *fakeMFA
 }
 
 func newTestEnv(t *testing.T, params password.Params) testEnv {
@@ -186,14 +330,20 @@ func newTestEnv(t *testing.T, params password.Params) testEnv {
 		sessions: newFakeSessions(),
 		lockout:  newFakeLockout(1000),
 		audit:    &fakeAudit{},
+		mailer:   &fakeMailer{},
+		mfa:      newFakeMFA(),
 	}
 	env.svc = NewService(Deps{
-		Users:    env.users,
-		Sessions: env.sessions,
-		Hasher:   hasher,
-		Lockout:  env.lockout,
-		Audit:    env.audit,
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Users:     env.users,
+		Sessions:  env.sessions,
+		Hasher:    hasher,
+		Lockout:   env.lockout,
+		Audit:     env.audit,
+		Tokens:    newTokenStore(t),
+		Mailer:    env.mailer,
+		MFA:       env.mfa,
+		PublicURL: "https://app.example.com/",
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return env
 }
@@ -313,6 +463,9 @@ func TestLoginRehashesOutdatedHash(t *testing.T) {
 		Hasher:   hasher,
 		Lockout:  newFakeLockout(1000),
 		Audit:    &fakeAudit{},
+		Tokens:   newTokenStore(t),
+		Mailer:   &fakeMailer{},
+		MFA:      newFakeMFA(),
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if _, err := strong.Login(ctx, "ana@example.com", goodPassword); err != nil {
@@ -345,7 +498,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 func TestCurrentDropsOrphanSession(t *testing.T) {
 	svc, _, sessions := newTestService(t, testParams)
 	ctx := context.Background()
-	token, _ := sessions.Create(ctx, "id-que-nao-existe")
+	token, _ := sessions.Create(ctx, "id-que-nao-existe", nil)
 
 	if _, err := svc.Current(ctx, token); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("esperava ErrUnauthenticated, recebeu %v", err)

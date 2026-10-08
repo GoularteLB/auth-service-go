@@ -13,6 +13,7 @@ import (
 	"github.com/GoularteLB/auth-service/internal/password"
 	"github.com/GoularteLB/auth-service/internal/session"
 	"github.com/GoularteLB/auth-service/internal/user"
+	"github.com/GoularteLB/auth-service/pkg/authn"
 )
 
 const maxEmailLength = 254
@@ -37,12 +38,14 @@ type Users interface {
 	ByEmail(ctx context.Context, email string) (user.User, error)
 	ByID(ctx context.Context, id string) (user.User, error)
 	UpdatePasswordHash(ctx context.Context, id, passwordHash string) error
+	MarkEmailVerified(ctx context.Context, id string) error
 }
 
 type Sessions interface {
-	Create(ctx context.Context, userID string) (string, error)
+	Create(ctx context.Context, userID string, amr []string) (string, error)
 	Get(ctx context.Context, token string) (session.Session, error)
 	Delete(ctx context.Context, token string) error
+	DeleteAll(ctx context.Context, userID string) error
 }
 
 type Lockout interface {
@@ -56,31 +59,43 @@ type Auditor interface {
 }
 
 type Deps struct {
-	Users    Users
-	Sessions Sessions
-	Hasher   *password.Hasher
-	Lockout  Lockout
-	Audit    Auditor
-	Logger   *slog.Logger
+	Users     Users
+	Sessions  Sessions
+	Hasher    *password.Hasher
+	Lockout   Lockout
+	Audit     Auditor
+	Tokens    OneTimeTokens
+	Mailer    Mailer
+	MFA       MFA
+	PublicURL string
+	Logger    *slog.Logger
 }
 
 type Service struct {
-	users    Users
-	sessions Sessions
-	hasher   *password.Hasher
-	lockout  Lockout
-	audit    Auditor
-	logger   *slog.Logger
+	users     Users
+	sessions  Sessions
+	hasher    *password.Hasher
+	lockout   Lockout
+	audit     Auditor
+	tokens    OneTimeTokens
+	mailer    Mailer
+	mfa       MFA
+	publicURL string
+	logger    *slog.Logger
 }
 
 func NewService(d Deps) *Service {
 	return &Service{
-		users:    d.Users,
-		sessions: d.Sessions,
-		hasher:   d.Hasher,
-		lockout:  d.Lockout,
-		audit:    d.Audit,
-		logger:   d.Logger,
+		users:     d.Users,
+		sessions:  d.Sessions,
+		hasher:    d.Hasher,
+		lockout:   d.Lockout,
+		audit:     d.Audit,
+		tokens:    d.Tokens,
+		mailer:    d.Mailer,
+		mfa:       d.MFA,
+		publicURL: strings.TrimRight(d.PublicURL, "/"),
+		logger:    d.Logger,
 	}
 }
 
@@ -102,11 +117,15 @@ func (s *Service) Signup(ctx context.Context, email, plain string) error {
 	switch {
 	case errors.Is(err, user.ErrEmailTaken):
 		s.record(ctx, audit.Event{Type: audit.SignupDuplicate, Email: email})
+		s.sendAccountExists(ctx, email)
 		return nil
 	case err != nil:
 		return err
 	}
 	s.record(ctx, audit.Event{Type: audit.SignupCreated, UserID: u.ID, Email: email})
+	if err := s.sendVerification(ctx, u.ID, email); err != nil {
+		s.logger.ErrorContext(ctx, "falha ao preparar verificação de e-mail", slog.Any("error", err))
+	}
 	return nil
 }
 
@@ -147,13 +166,21 @@ func (s *Service) Login(ctx context.Context, email, plain string) (string, error
 	if s.hasher.NeedsRehash(u.PasswordHash) {
 		s.rehash(ctx, u.ID, plain)
 	}
+	if err := s.lockout.Reset(ctx, email); err != nil {
+		s.logger.WarnContext(ctx, "falha ao limpar bloqueio", slog.Any("error", err))
+	}
 
-	token, err := s.sessions.Create(ctx, u.ID)
+	mfaOn, err := s.mfa.Enabled(ctx, u.ID)
 	if err != nil {
 		return "", err
 	}
-	if err := s.lockout.Reset(ctx, email); err != nil {
-		s.logger.WarnContext(ctx, "falha ao limpar bloqueio", slog.Any("error", err))
+	if mfaOn {
+		return "", s.challengeMFA(ctx, u)
+	}
+
+	token, err := s.sessions.Create(ctx, u.ID, []string{authn.AMRPassword})
+	if err != nil {
+		return "", err
 	}
 	s.record(ctx, audit.Event{Type: audit.LoginSucceeded, UserID: u.ID, Email: email})
 	return token, nil
@@ -175,12 +202,17 @@ func (s *Service) Logout(ctx context.Context, token string) error {
 }
 
 func (s *Service) Current(ctx context.Context, token string) (user.User, error) {
+	u, _, err := s.Identify(ctx, token)
+	return u, err
+}
+
+func (s *Service) Identify(ctx context.Context, token string) (user.User, []string, error) {
 	sess, err := s.sessions.Get(ctx, token)
 	if errors.Is(err, session.ErrNotFound) {
-		return user.User{}, ErrUnauthenticated
+		return user.User{}, nil, ErrUnauthenticated
 	}
 	if err != nil {
-		return user.User{}, err
+		return user.User{}, nil, err
 	}
 
 	u, err := s.users.ByID(ctx, sess.UserID)
@@ -188,12 +220,12 @@ func (s *Service) Current(ctx context.Context, token string) (user.User, error) 
 		if err := s.sessions.Delete(ctx, token); err != nil {
 			s.logger.WarnContext(ctx, "falha ao apagar sessão órfã", slog.Any("error", err))
 		}
-		return user.User{}, ErrUnauthenticated
+		return user.User{}, nil, ErrUnauthenticated
 	}
 	if err != nil {
-		return user.User{}, err
+		return user.User{}, nil, err
 	}
-	return u, nil
+	return u, sess.AMR, nil
 }
 
 func (s *Service) reject(ctx context.Context, plain string) error {

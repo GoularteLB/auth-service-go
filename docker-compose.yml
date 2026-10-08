@@ -30,6 +30,11 @@ services:
       timeout: 3s
       retries: 10
 
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:${MAILPIT_PORT:-8025}:8025"
+
   migrate:
     build: .
     entrypoint: ["/app/migrate", "up"]
@@ -46,12 +51,17 @@ services:
       AUTH_LOG_LEVEL: ${AUTH_LOG_LEVEL:-info}
       AUTH_DATABASE_URL: postgres://auth:${POSTGRES_PASSWORD}@postgres:5432/auth?sslmode=disable
       AUTH_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      AUTH_SMTP_URL: smtp://mailpit:1025
+      AUTH_PUBLIC_URL: ${AUTH_PUBLIC_URL:-http://localhost:5173}
+      AUTH_MFA_KEY: ${AUTH_MFA_KEY:-}
     ports:
       - "127.0.0.1:${AUTH_PORT:-8080}:8080"
       - "127.0.0.1:${AUTH_INTERNAL_PORT:-8081}:8081"
     depends_on:
       redis:
         condition: service_healthy
+      mailpit:
+        condition: service_started
       migrate:
         condition: service_completed_successfully
 
