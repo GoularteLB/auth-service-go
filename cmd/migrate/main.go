@@ -24,12 +24,12 @@ func run(args []string) error {
 		return errors.New(usage)
 	}
 
-	cfg, err := config.Load()
+	databaseURL, err := config.LoadDatabaseURL()
 	if err != nil {
 		return fmt.Errorf("configuração inválida: %w", err)
 	}
 
-	m, err := database.NewMigrator(cfg.DatabaseURL)
+	m, err := database.NewMigrator(databaseURL)
 	if err != nil {
 		return err
 	}
