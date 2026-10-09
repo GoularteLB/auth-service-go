@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,18 @@ func New(addr string, handler http.Handler, logger *slog.Logger) *http.Server {
 	}
 }
 
+func UseTLS(srv *http.Server, certFile, keyFile string) error {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("carregando certificado tls: %w", err)
+	}
+	srv.TLSConfig = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+	}
+	return nil
+}
+
 func Run(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", srv.Addr)
@@ -35,6 +48,10 @@ func Run(ctx context.Context, srv *http.Server, shutdownTimeout time.Duration) e
 func Serve(ctx context.Context, srv *http.Server, ln net.Listener, shutdownTimeout time.Duration) error {
 	errCh := make(chan error, 1)
 	go func() {
+		if srv.TLSConfig != nil {
+			errCh <- srv.ServeTLS(ln, "", "")
+			return
+		}
 		errCh <- srv.Serve(ln)
 	}()
 

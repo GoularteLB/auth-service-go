@@ -2,12 +2,22 @@ package httpserver
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +163,90 @@ func TestServeShutsDownGracefully(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("servidor não encerrou a tempo")
+	}
+}
+
+func writeTestCert(t *testing.T) (string, string, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "auth-service"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "internal.crt"), filepath.Join(dir, "internal.key")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
+}
+
+func TestServeWithTLS(t *testing.T) {
+	certFile, keyFile, pool := writeTestCert(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := New(ln.Addr().String(), newTestHandler(t, fakeDB{}, false), logger)
+	if err := UseTLS(srv, certFile, keyFile); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, srv, ln, time.Second) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	if resp, err := http.Get("http://" + ln.Addr().String() + "/healthz"); err == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Fatal("servidor com tls respondeu em texto puro")
+		}
+	}
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}}}
+	resp, err := client.Get("https://" + ln.Addr().String() + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.TLS == nil || resp.TLS.Version != tls.VersionTLS13 {
+		t.Fatalf("status = %d, tls = %+v", resp.StatusCode, resp.TLS)
+	}
+}
+
+func TestUseTLSWithMissingFiles(t *testing.T) {
+	srv := New("127.0.0.1:0", http.NotFoundHandler(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := UseTLS(srv, "/nao/existe.crt", "/nao/existe.key"); err == nil {
+		t.Fatal("aceitou certificado inexistente")
 	}
 }
