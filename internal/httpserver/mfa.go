@@ -122,6 +122,8 @@ func (h *authHandler) mfaError(w http.ResponseWriter, r *http.Request, err error
 		writeErrorMessage(w, http.StatusUnauthorized, err.Error())
 	case errors.Is(err, auth.ErrInvalidCredentials):
 		writeErrorMessage(w, http.StatusForbidden, "senha incorreta")
+	case errors.Is(err, auth.ErrEmailNotVerified):
+		writeErrorMessage(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, auth.ErrInvalidMFACode):
 		writeErrorMessage(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, auth.ErrMFAEnabled),

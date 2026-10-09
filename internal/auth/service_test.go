@@ -276,6 +276,16 @@ func (f *fakeLockout) Fail(_ context.Context, key string) (time.Duration, error)
 	return 0, nil
 }
 
+func (f *fakeLockout) total() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, v := range f.fails {
+		n += v
+	}
+	return n
+}
+
 func (f *fakeLockout) Reset(_ context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -314,6 +324,7 @@ type testEnv struct {
 	users    *fakeUsers
 	sessions *fakeSessions
 	lockout  *fakeLockout
+	account  *fakeLockout
 	audit    *fakeAudit
 	mailer   *fakeMailer
 	mfa      *fakeMFA
@@ -329,21 +340,23 @@ func newTestEnv(t *testing.T, params password.Params) testEnv {
 		users:    newFakeUsers(),
 		sessions: newFakeSessions(),
 		lockout:  newFakeLockout(1000),
+		account:  newFakeLockout(1000),
 		audit:    &fakeAudit{},
 		mailer:   &fakeMailer{},
 		mfa:      newFakeMFA(),
 	}
 	env.svc = NewService(Deps{
-		Users:     env.users,
-		Sessions:  env.sessions,
-		Hasher:    hasher,
-		Lockout:   env.lockout,
-		Audit:     env.audit,
-		Tokens:    newTokenStore(t),
-		Mailer:    env.mailer,
-		MFA:       env.mfa,
-		PublicURL: "https://app.example.com/",
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Users:          env.users,
+		Sessions:       env.sessions,
+		Hasher:         hasher,
+		Lockout:        env.lockout,
+		AccountLockout: env.account,
+		Audit:          env.audit,
+		Tokens:         newTokenStore(t),
+		Mailer:         env.mailer,
+		MFA:            env.mfa,
+		PublicURL:      "https://app.example.com/",
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return env
 }
@@ -458,15 +471,16 @@ func TestLoginRehashesOutdatedHash(t *testing.T) {
 		t.Fatal(err)
 	}
 	strong := NewService(Deps{
-		Users:    users,
-		Sessions: sessions,
-		Hasher:   hasher,
-		Lockout:  newFakeLockout(1000),
-		Audit:    &fakeAudit{},
-		Tokens:   newTokenStore(t),
-		Mailer:   &fakeMailer{},
-		MFA:      newFakeMFA(),
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Users:          users,
+		Sessions:       sessions,
+		Hasher:         hasher,
+		Lockout:        newFakeLockout(1000),
+		AccountLockout: newFakeLockout(1000),
+		Audit:          &fakeAudit{},
+		Tokens:         newTokenStore(t),
+		Mailer:         &fakeMailer{},
+		MFA:            newFakeMFA(),
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if _, err := strong.Login(ctx, "ana@example.com", goodPassword); err != nil {
 		t.Fatal(err)
@@ -557,8 +571,64 @@ func TestSuccessfulLoginResetsLockout(t *testing.T) {
 	if _, err := env.svc.Login(ctx, "ana@example.com", goodPassword); err != nil {
 		t.Fatal(err)
 	}
-	if env.lockout.fails["ana@example.com"] != 0 {
+	if env.lockout.fails[passwordLockKey(ctx, "ana@example.com")] != 0 {
 		t.Fatal("login bem-sucedido não zerou as falhas")
+	}
+}
+
+func fromIP(ip string) context.Context {
+	return audit.WithClient(context.Background(), audit.Client{IP: ip})
+}
+
+func TestLockoutIsPerIP(t *testing.T) {
+	env := newTestEnv(t, testParams)
+	env.lockout.threshold = 3
+	_ = env.svc.Signup(context.Background(), "ana@example.com", goodPassword)
+	attacker, owner := fromIP("203.0.113.7"), fromIP("198.51.100.20")
+
+	for range 3 {
+		_, _ = env.svc.Login(attacker, "ana@example.com", "senha-errada-aqui")
+	}
+	if _, err := env.svc.Login(attacker, "ana@example.com", goodPassword); !errors.Is(err, ErrLocked) {
+		t.Fatalf("ip que errou deveria estar bloqueado, recebeu %v", err)
+	}
+	if _, err := env.svc.Login(owner, "ana@example.com", goodPassword); err != nil {
+		t.Fatalf("dono foi trancado pelos erros de outro ip: %v", err)
+	}
+}
+
+func TestLockoutGroupsIPv6By64(t *testing.T) {
+	env := newTestEnv(t, testParams)
+	env.lockout.threshold = 3
+	_ = env.svc.Signup(context.Background(), "ana@example.com", goodPassword)
+
+	for i := range 3 {
+		_, _ = env.svc.Login(fromIP("2001:db8:1:2::"+strconv.Itoa(i+1)), "ana@example.com", "senha-errada-aqui")
+	}
+	if _, err := env.svc.Login(fromIP("2001:db8:1:2::ffff"), "ana@example.com", goodPassword); !errors.Is(err, ErrLocked) {
+		t.Fatalf("trocar de endereço dentro do mesmo /64 escapou do bloqueio: %v", err)
+	}
+	if _, err := env.svc.Login(fromIP("2001:db8:1:3::1"), "ana@example.com", goodPassword); err != nil {
+		t.Fatalf("outro /64 foi bloqueado: %v", err)
+	}
+}
+
+func TestAccountLockoutStopsDistributedAttack(t *testing.T) {
+	env := newTestEnv(t, testParams)
+	env.account.threshold = 4
+	_ = env.svc.Signup(context.Background(), "ana@example.com", goodPassword)
+
+	for i := range 4 {
+		ctx := fromIP("203.0.113." + strconv.Itoa(i+1))
+		if _, err := env.svc.Login(ctx, "ana@example.com", "senha-errada-aqui"); !errors.Is(err, ErrInvalidCredentials) {
+			t.Fatalf("tentativa %d: %v", i, err)
+		}
+	}
+	if _, err := env.svc.Login(fromIP("192.0.2.99"), "ana@example.com", goodPassword); !errors.Is(err, ErrLocked) {
+		t.Fatalf("teto global não bloqueou ataque distribuído, recebeu %v", err)
+	}
+	if env.account.fails[accountLockKey("ana@example.com")] != 4 {
+		t.Errorf("falhas globais = %v", env.account.fails)
 	}
 }
 

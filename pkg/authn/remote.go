@@ -3,12 +3,16 @@ package authn
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,13 +25,31 @@ type RemoteKeys struct {
 	MinInterval time.Duration
 
 	url         *url.URL
+	allowHTTP   bool
 	mu          sync.Mutex
 	keys        map[string]ed25519.PublicKey
 	fetchedAt   time.Time
 	attemptedAt time.Time
 }
 
-func NewRemoteKeys(rawURL string) (*RemoteKeys, error) {
+type Option func(*RemoteKeys)
+
+func AllowInsecureHTTP() Option {
+	return func(r *RemoteKeys) { r.allowHTTP = true }
+}
+
+func WithRootCAs(pool *x509.CertPool) Option {
+	return func(r *RemoteKeys) {
+		transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = base.Clone()
+		}
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
+		r.Client.Transport = transport
+	}
+}
+
+func NewRemoteKeys(rawURL string, opts ...Option) (*RemoteKeys, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("authn: url do jwks inválida: %w", err)
@@ -35,7 +57,7 @@ func NewRemoteKeys(rawURL string) (*RemoteKeys, error) {
 	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
 		return nil, errors.New("authn: url do jwks precisa ser http(s)://host/caminho, sem credenciais")
 	}
-	return &RemoteKeys{
+	r := &RemoteKeys{
 		url: u,
 		Client: &http.Client{
 			Timeout: 5 * time.Second,
@@ -45,7 +67,22 @@ func NewRemoteKeys(rawURL string) (*RemoteKeys, error) {
 		},
 		MaxAge:      10 * time.Minute,
 		MinInterval: 30 * time.Second,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	if u.Scheme == "http" && !r.allowHTTP && !isLoopback(u.Hostname()) {
+		return nil, errors.New("authn: jwks por http:// só em localhost, use https:// ou AllowInsecureHTTP() em desenvolvimento")
+	}
+	return r, nil
+}
+
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
 }
 
 func (r *RemoteKeys) Key(ctx context.Context, kid string) (ed25519.PublicKey, error) {

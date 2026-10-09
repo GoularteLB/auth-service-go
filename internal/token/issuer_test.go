@@ -3,6 +3,7 @@ package token
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,7 +21,7 @@ func TestIssueVerifiesAgainstOwnJWKS(t *testing.T) {
 	}
 	iss := NewIssuer(key, nil, opts)
 
-	tok, ttl, err := iss.Issue("user-1", "cli_bff", nil, nil)
+	tok, ttl, err := iss.Issue("user-1", "cli_bff", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,9 +46,33 @@ func TestIssueVerifiesAgainstOwnJWKS(t *testing.T) {
 		t.Errorf("claims inesperadas: %+v", c)
 	}
 
-	other, _, _ := iss.Issue("user-1", "cli_bff", nil, nil)
+	other, _, _ := iss.Issue("user-1", "cli_bff", "", nil, nil)
 	if other == tok {
 		t.Error("dois tokens iguais, jti não está variando")
+	}
+}
+
+func TestIssueWithAudience(t *testing.T) {
+	key, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	iss := NewIssuer(key, nil, opts)
+	tok, _, err := iss.Issue("user-1", "cli_bff", "pedidos", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := key.Public().(ed25519.PublicKey)
+	keys := authn.StaticKeys{iss.KeyID(): pub}
+
+	if _, err := (&authn.Verifier{Keys: keys, Issuer: "auth-service", Audience: "pedidos"}).Verify(context.Background(), tok); err != nil {
+		t.Fatalf("serviço de pedidos recusou o próprio token: %v", err)
+	}
+	for _, other := range []string{"estoque", "internal"} {
+		v := &authn.Verifier{Keys: keys, Issuer: "auth-service", Audience: other}
+		if _, err := v.Verify(context.Background(), tok); !errors.Is(err, authn.ErrWrongAudience) {
+			t.Errorf("%s aceitou token de pedidos: %v", other, err)
+		}
 	}
 }
 

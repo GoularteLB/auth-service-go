@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 	"time"
 )
@@ -26,6 +25,7 @@ type Config struct {
 	Env             Environment
 	HTTPAddr        string
 	InternalAddr    string
+	InternalTLS     TLS
 	DatabaseURL     string
 	RedisURL        string
 	LogLevel        slog.Level
@@ -38,6 +38,15 @@ type Config struct {
 	MailFrom        string
 	MFAKey          []byte
 	MFAIssuer       string
+}
+
+type TLS struct {
+	CertFile string
+	KeyFile  string
+}
+
+func (t TLS) Enabled() bool {
+	return t.CertFile != ""
 }
 
 type JWT struct {
@@ -57,6 +66,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("env", string(c.Env)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("internal_addr", c.InternalAddr),
+		slog.Bool("internal_tls", c.InternalTLS.Enabled()),
 		slog.String("database_url", redactURL(c.DatabaseURL)),
 		slog.String("redis_url", redactURL(c.RedisURL)),
 		slog.String("log_level", c.LogLevel.String()),
@@ -115,6 +125,10 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		DatabaseURL:  get("AUTH_DATABASE_URL", ""),
 		RedisURL:     get("AUTH_REDIS_URL", ""),
 		SMTPURL:      get("AUTH_SMTP_URL", ""),
+		InternalTLS: TLS{
+			CertFile: get("AUTH_INTERNAL_TLS_CERT_FILE", ""),
+			KeyFile:  get("AUTH_INTERNAL_TLS_KEY_FILE", ""),
+		},
 		JWT: JWT{
 			KeyFile:          get("AUTH_JWT_KEY_FILE", ""),
 			PreviousKeyFiles: splitList(get("AUTH_JWT_PREVIOUS_KEY_FILES", "")),
@@ -135,6 +149,10 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		errs = append(errs, fmt.Errorf("AUTH_INTERNAL_ADDR inválido: %w", err))
 	} else if cfg.InternalAddr == cfg.HTTPAddr {
 		errs = append(errs, errors.New("AUTH_INTERNAL_ADDR precisa ser diferente de AUTH_HTTP_ADDR"))
+	}
+
+	if err := validateInternalTLS(cfg.InternalTLS, cfg.Env); err != nil {
+		errs = append(errs, err)
 	}
 
 	jwtTTL, err := time.ParseDuration(get("AUTH_JWT_TTL", "5m"))
@@ -240,11 +258,18 @@ func validateDatabaseURL(raw string, env Environment) error {
 	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
 		return errors.New("AUTH_DATABASE_URL precisa de host e nome do banco")
 	}
-	if env == Production {
-		secure := []string{"require", "verify-ca", "verify-full"}
-		if !slices.Contains(secure, u.Query().Get("sslmode")) {
-			return errors.New("em produção AUTH_DATABASE_URL precisa de sslmode=require, verify-ca ou verify-full")
-		}
+	if env == Production && u.Query().Get("sslmode") != "verify-full" {
+		return errors.New("em produção AUTH_DATABASE_URL precisa de sslmode=verify-full")
+	}
+	return nil
+}
+
+func validateInternalTLS(t TLS, env Environment) error {
+	if (t.CertFile == "") != (t.KeyFile == "") {
+		return errors.New("AUTH_INTERNAL_TLS_CERT_FILE e AUTH_INTERNAL_TLS_KEY_FILE precisam vir juntos")
+	}
+	if env == Production && !t.Enabled() {
+		return errors.New("em produção AUTH_INTERNAL_TLS_CERT_FILE e AUTH_INTERNAL_TLS_KEY_FILE são obrigatórios")
 	}
 	return nil
 }

@@ -44,12 +44,15 @@ func NewIssuer(key ed25519.PrivateKey, previous []ed25519.PublicKey, opts Option
 	return &Issuer{key: key, kid: authn.Thumbprint(pub), opts: opts, jwks: jwks, now: time.Now}
 }
 
-func (i *Issuer) Issue(subject, clientID string, scopes, amr []string) (string, time.Duration, error) {
+func (i *Issuer) Issue(subject, clientID, audience string, scopes, amr []string) (string, time.Duration, error) {
+	if audience == "" {
+		audience = i.opts.Audience
+	}
 	now := i.now().UTC()
 	token, err := authn.Sign(i.key, i.kid, authn.Claims{
 		Issuer:    i.opts.Issuer,
 		Subject:   subject,
-		Audience:  authn.Audience{i.opts.Audience},
+		Audience:  authn.Audience{audience},
 		IssuedAt:  now.Unix(),
 		NotBefore: now.Unix(),
 		ExpiresAt: now.Add(i.opts.TTL).Unix(),

@@ -21,6 +21,7 @@ var (
 	ErrMFARequired       = errors.New("informe o código do autenticador")
 	ErrMFAChallenge      = errors.New("desafio de mfa inválido ou expirado, faça login de novo")
 	ErrInvalidMFACode    = errors.New("código inválido")
+	ErrEmailNotVerified  = errors.New("confirme seu e-mail antes de ativar a verificação em duas etapas")
 	ErrMFANotEnabled     = mfa.ErrNotEnabled
 	ErrMFAEnabled        = mfa.ErrAlreadyEnabled
 	ErrMFANoPendingSetup = mfa.ErrNoPendingSetup
@@ -110,6 +111,9 @@ func (s *Service) SetupMFA(ctx context.Context, sessionToken, plain string) (mfa
 	if err != nil {
 		return mfa.Setup{}, err
 	}
+	if !u.EmailVerified() {
+		return mfa.Setup{}, ErrEmailNotVerified
+	}
 	if err := s.confirmPassword(ctx, u, plain); err != nil {
 		return mfa.Setup{}, err
 	}
@@ -120,6 +124,9 @@ func (s *Service) EnableMFA(ctx context.Context, sessionToken, code string) ([]s
 	u, err := s.Current(ctx, sessionToken)
 	if err != nil {
 		return nil, err
+	}
+	if !u.EmailVerified() {
+		return nil, ErrEmailNotVerified
 	}
 	codes, err := s.mfa.Enable(ctx, u.ID, code)
 	if errors.Is(err, mfa.ErrInvalidCode) {
@@ -176,7 +183,7 @@ func (s *Service) DisableMFA(ctx context.Context, sessionToken, plain, code stri
 }
 
 func (s *Service) confirmPassword(ctx context.Context, u user.User, plain string) error {
-	retry, err := s.lockout.Check(ctx, u.Email)
+	retry, err := s.checkPasswordLock(ctx, u.Email)
 	if err != nil {
 		return err
 	}

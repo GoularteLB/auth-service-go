@@ -9,11 +9,24 @@ import (
 	"github.com/GoularteLB/auth-service/internal/audit"
 )
 
+func verifiedSignup(t *testing.T, env testEnv) {
+	t.Helper()
+	ctx := context.Background()
+	_ = env.svc.Signup(ctx, "ana@example.com", goodPassword)
+	u, err := env.users.ByEmail(ctx, "ana@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.users.MarkEmailVerified(ctx, u.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func enrolledEnv(t *testing.T) (testEnv, string) {
 	t.Helper()
 	env := newTestEnv(t, testParams)
 	ctx := context.Background()
-	_ = env.svc.Signup(ctx, "ana@example.com", goodPassword)
+	verifiedSignup(t, env)
 	session, err := env.svc.Login(ctx, "ana@example.com", goodPassword)
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +53,7 @@ func mfaChallenge(t *testing.T, env testEnv) string {
 func TestSetupRequiresPassword(t *testing.T) {
 	env := newTestEnv(t, testParams)
 	ctx := context.Background()
-	_ = env.svc.Signup(ctx, "ana@example.com", goodPassword)
+	verifiedSignup(t, env)
 	session, _ := env.svc.Login(ctx, "ana@example.com", goodPassword)
 
 	if _, err := env.svc.SetupMFA(ctx, session, "senha-errada-aqui"); !errors.Is(err, ErrInvalidCredentials) {
@@ -51,6 +64,26 @@ func TestSetupRequiresPassword(t *testing.T) {
 	}
 	if _, err := env.svc.EnableMFA(ctx, session, "111111"); !errors.Is(err, ErrMFANoPendingSetup) {
 		t.Fatalf("ativar sem setup: %v", err)
+	}
+}
+
+func TestMFARequiresVerifiedEmail(t *testing.T) {
+	env := newTestEnv(t, testParams)
+	ctx := context.Background()
+	_ = env.svc.Signup(ctx, "ana@example.com", goodPassword)
+	session, err := env.svc.Login(ctx, "ana@example.com", goodPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := env.svc.SetupMFA(ctx, session, goodPassword); !errors.Is(err, ErrEmailNotVerified) {
+		t.Fatalf("setup sem e-mail confirmado: %v", err)
+	}
+	if _, err := env.svc.EnableMFA(ctx, session, "111111"); !errors.Is(err, ErrEmailNotVerified) {
+		t.Fatalf("enable sem e-mail confirmado: %v", err)
+	}
+	if env.lockout.total() != 0 {
+		t.Error("recusa por e-mail não confirmado contou como senha errada")
 	}
 }
 

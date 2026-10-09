@@ -74,6 +74,13 @@ func TestLoadErrors(t *testing.T) {
 		{"timeout inválido", base(map[string]string{"AUTH_SHUTDOWN_TIMEOUT": "abc"}), "AUTH_SHUTDOWN_TIMEOUT"},
 		{"timeout longo demais", base(map[string]string{"AUTH_SHUTDOWN_TIMEOUT": "5m"}), "AUTH_SHUTDOWN_TIMEOUT"},
 		{"produção sem tls", base(map[string]string{"AUTH_ENV": "production"}), "sslmode"},
+		{"produção com sslmode=require", base(map[string]string{
+			"AUTH_ENV":          "production",
+			"AUTH_DATABASE_URL": "postgres://auth:secret@db:5432/auth?sslmode=require",
+		}), "sslmode=verify-full"},
+		{"produção sem tls interno", base(map[string]string{"AUTH_ENV": "production"}), "AUTH_INTERNAL_TLS_CERT_FILE"},
+		{"tls interno sem chave", base(map[string]string{"AUTH_INTERNAL_TLS_CERT_FILE": "/run/secrets/internal.crt"}), "precisam vir juntos"},
+		{"tls interno sem certificado", base(map[string]string{"AUTH_INTERNAL_TLS_KEY_FILE": "/run/secrets/internal.key"}), "precisam vir juntos"},
 		{"sem redis", map[string]string{"AUTH_DATABASE_URL": validURL}, "AUTH_REDIS_URL é obrigatório"},
 		{"esquema do redis errado", base(map[string]string{"AUTH_REDIS_URL": "http://localhost:6379"}), "redis://"},
 		{"redis sem tls em produção", base(map[string]string{
@@ -137,6 +144,9 @@ func TestProductionWithTLS(t *testing.T) {
 		"AUTH_SMTP_URL":     "smtp://user:pw@smtp.example.com:587",
 		"AUTH_MAIL_FROM":    "Exemplo <no-reply@example.com>",
 		"AUTH_MFA_KEY":      base64.StdEncoding.EncodeToString(make([]byte, 32)),
+
+		"AUTH_INTERNAL_TLS_CERT_FILE": "/run/secrets/internal.crt",
+		"AUTH_INTERNAL_TLS_KEY_FILE":  "/run/secrets/internal.key",
 	}))
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)

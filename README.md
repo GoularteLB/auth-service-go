@@ -19,7 +19,7 @@ O projeto está sendo construído em fases curtas. Cada fase só começa quando 
 
 ## Rodando
 
-Você precisa de Go 1.27+ e Docker.
+Você precisa de Go 1.27.2+ e Docker.
 
 ```bash
 cp .env.example .env
@@ -56,7 +56,7 @@ go run ./cmd/auth
 | `POST /v1/auth/email/resend` | manda outro link de confirmação para quem está logado |
 | `POST /v1/auth/password/forgot` | `{"email"}` responde `202` sempre, exista a conta ou não |
 | `POST /v1/auth/password/reset` | `{"token", "password"}` troca a senha |
-| `POST /v1/auth/mfa/setup` | `{"password"}` gera o segredo e a URL `otpauth://` para o QR code |
+| `POST /v1/auth/mfa/setup` | `{"password"}` gera o segredo e a URL `otpauth://` para o QR code, só com e-mail confirmado |
 | `POST /v1/auth/mfa/enable` | `{"code"}` confirma o primeiro código e devolve os códigos de recuperação |
 | `POST /v1/auth/mfa/disable` | `{"password", "code"}` desliga o MFA |
 
@@ -89,7 +89,7 @@ Em desenvolvimento, o compose sobe o [Mailpit](https://mailpit.axllent.org): tod
 
 ## Verificação em duas etapas
 
-O usuário logado chama `mfa/setup` com a senha atual. A resposta traz o segredo e uma URL `otpauth://`, que a SPA mostra como QR code. Ele escaneia no autenticador, manda o primeiro código em `mfa/enable` e recebe 10 códigos de recuperação. Esses códigos aparecem uma única vez.
+O usuário logado e com e-mail confirmado chama `mfa/setup` com a senha atual. Sem o e-mail confirmado, `setup` e `enable` respondem `403`. Isso impede que alguém cadastre o e-mail de outra pessoa, ligue o MFA com o próprio celular e deixe a dona do e-mail trancada fora quando ela redefinir a senha. A resposta traz o segredo e uma URL `otpauth://`, que a SPA mostra como QR code. Ele escaneia no autenticador, manda o primeiro código em `mfa/enable` e recebe 10 códigos de recuperação. Esses códigos aparecem uma única vez.
 
 Com o MFA ativo, o login muda:
 
@@ -108,7 +108,7 @@ Gere a chave com `openssl rand -base64 32`. Em desenvolvimento, sem ela, o servi
 
 ## Tokens para os microsserviços
 
-O serviço escuta em duas portas. A `8080` é pública e atende a SPA. A `8081` é interna e não deve ser exposta para fora da rede dos serviços:
+O serviço escuta em duas portas. A `8080` é pública e atende a SPA. A `8081` é interna e não deve ser exposta para fora da rede dos serviços. Em produção ela só sobe com TLS (`AUTH_INTERNAL_TLS_CERT_FILE` e `AUTH_INTERNAL_TLS_KEY_FILE`, TLS 1.3), porque é por ela que passam o segredo dos clientes, os tokens e o JWKS:
 
 | Rota interna | |
 |---|---|
@@ -120,16 +120,17 @@ Nenhuma das duas rotas de token é aberta: quem chama precisa ser um cliente cad
 
 ### Clientes
 
-Cada serviço que fala com o auth-service é um cliente com escopos. Para cadastrar, use a CLI:
+Cada serviço que fala com o auth-service é um cliente com escopos e com a lista de audiências para as quais ele pode pedir token. Para cadastrar, use a CLI:
 
 ```bash
-go run ./cmd/client create bff session:exchange
-go run ./cmd/client create pedidos estoque:ler estoque:escrever
+go run ./cmd/client create bff session:exchange --audience pedidos,estoque
+go run ./cmd/client create pedidos estoque:ler estoque:escrever --audience estoque
+go run ./cmd/client audiences cli_xxxxx pedidos estoque pagamentos
 go run ./cmd/client list
 go run ./cmd/client revoke cli_xxxxx
 ```
 
-No Docker é o mesmo binário: `docker compose run --rm --entrypoint /app/client auth create bff session:exchange`.
+`audiences` troca a lista inteira de um cliente que já existe. No Docker é o mesmo binário: `docker compose run --rm --entrypoint /app/client auth create bff session:exchange --audience pedidos`.
 
 O segredo aparece uma vez só. No banco fica apenas o SHA-256 dele, o que basta porque o segredo é aleatório e longo, sem o custo de um Argon2 a cada chamada. Revogar corta novas emissões na hora. Os tokens já emitidos continuam valendo até expirar, no máximo `AUTH_JWT_TTL`.
 
@@ -139,19 +140,21 @@ O BFF precisa do escopo `session:exchange`. Ele pega o cookie de sessão que rec
 
 ```bash
 curl -s localhost:8081/internal/v1/token -u "$BFF_ID:$BFF_SECRET" \
-  -H 'Content-Type: application/json' -d '{"session_token":"<valor do cookie>"}'
+  -H 'Content-Type: application/json' -d '{"session_token":"<valor do cookie>","audience":"pedidos"}'
 ```
 
-O token sai com `sub` igual ao id do usuário e `client_id` igual ao do BFF. Guarde o JWT por sessão e só troque de novo perto de expirar: a rota aceita até 3000 trocas por minuto por IP.
+O token sai com `sub` igual ao id do usuário, `client_id` igual ao do BFF e `aud` igual à audiência pedida. O BFF pede um token por serviço que vai chamar, e assim um serviço que receba o token não consegue reaproveitá-lo em outro. Audiência fora da lista do cliente dá `400 invalid_target`. Guarde o JWT por sessão e por audiência e só troque de novo perto de expirar: a rota aceita até 3000 trocas por minuto por IP.
 
 ### Serviço para serviço
 
 ```bash
 curl -s localhost:8081/internal/v1/oauth/token -u "$PEDIDOS_ID:$PEDIDOS_SECRET" \
-  -d grant_type=client_credentials -d 'scope=estoque:ler'
+  -d grant_type=client_credentials -d 'scope=estoque:ler' -d audience=estoque
 ```
 
-Sem `scope`, o token vem com todos os escopos do cliente. Pedir um escopo que o cliente não tem dá `invalid_scope`. Aqui `sub` e `client_id` são o próprio cliente. Os erros seguem a RFC 6749 (`invalid_client`, `invalid_scope`, `unsupported_grant_type`), e o segredo só é aceito no header, nunca no corpo.
+Sem `scope`, o token vem com todos os escopos do cliente. Pedir um escopo que o cliente não tem dá `invalid_scope`, e uma audiência fora da lista dá `invalid_target`. Aqui `sub` e `client_id` são o próprio cliente. Os erros seguem a RFC 6749 e a RFC 8707 (`invalid_client`, `invalid_scope`, `invalid_target`, `unsupported_grant_type`), e o segredo só é aceito no header, nunca no corpo.
+
+Cliente com lista de audiências é obrigado a pedir uma delas, e sem `audience` recebe `invalid_target`. Só cliente sem lista, cadastrado antes das audiências, pode omitir o campo e recebe `AUTH_JWT_AUDIENCE`, que qualquer serviço que ainda valide essa audiência genérica aceita. Isso existe só para a migração: dê uma lista a cada cliente com `client audiences` e, quando todos os serviços validarem a própria audiência, ninguém mais deve aceitar `internal`.
 
 ### Formato do token
 
@@ -172,20 +175,22 @@ O `amr` é da sessão, não do usuário. Quem liga o MFA continua com a sessão 
 O pacote `pkg/authn` é público justamente para os outros serviços importarem:
 
 ```go
-keys, err := authn.NewRemoteKeys("http://auth-service:8081/.well-known/jwks.json")
+keys, err := authn.NewRemoteKeys("https://auth-service:8081/.well-known/jwks.json", authn.WithRootCAs(caInterna))
 if err != nil {
 	log.Fatal(err)
 }
 verifier := &authn.Verifier{
 	Keys:     keys,
 	Issuer:   "auth-service",
-	Audience: "internal",
+	Audience: "pedidos",
 	Leeway:   30 * time.Second,
 }
 mux.Handle("GET /pedidos", verifier.Middleware(pedidos))
 mux.Handle("POST /estoque/baixa", verifier.Middleware(authn.RequireScope("estoque:escrever", baixa)))
 mux.Handle("POST /conta/pix", verifier.Middleware(authn.RequireMFA(pix)))
 ```
+
+Cada serviço valida a **própria** audiência. `NewRemoteKeys` recusa `http://` fora de localhost, porque quem consegue trocar o JWKS no caminho consegue forjar qualquer token. `WithRootCAs` serve para a CA interna que assinou o certificado da `8081`. Em desenvolvimento, com o compose sem TLS, passe `authn.AllowInsecureHTTP()`.
 
 Dentro do handler, `authn.ClaimsFrom(r.Context())` devolve as claims. `claims.IsService()` diz se quem chamou foi um serviço ou um usuário via BFF, e `RequireScope` responde `403` com `insufficient_scope` quando falta permissão. Para uma rota que exige MFA, use `authn.RequireMFA`: sem `mfa` no `amr`, ela responde `401` com `insufficient_user_authentication` (RFC 9470), e a SPA pode pedir para o usuário entrar de novo com o segundo fator. Token de serviço nunca passa por ela. As chaves ficam em cache por 10 minutos. Um `kid` desconhecido força uma nova busca, mas no máximo uma a cada 30 segundos, para um token inventado não virar enxurrada de requisições no JWKS. Se o JWKS cair, as chaves que já estão em cache continuam valendo.
 
@@ -197,38 +202,62 @@ go run ./cmd/keygen secrets/jwt-2026-10.pem
 
 Isso gera a privada e a `.pub.pem` ao lado. Em desenvolvimento, sem `AUTH_JWT_KEY_FILE`, o serviço cria uma chave temporária a cada boot e avisa no log. Em produção ele não sobe sem a chave.
 
-Para rotacionar, gere a chave nova, aponte `AUTH_JWT_KEY_FILE` para ela e coloque a `.pub.pem` da antiga em `AUTH_JWT_PREVIOUS_KEY_FILES`. As duas aparecem no JWKS, e os tokens antigos continuam valendo até expirar. Depois de alguns minutos, a antiga já pode sair.
+Para rotacionar, gere a chave nova, aponte `AUTH_JWT_KEY_FILE` para ela e coloque a `.pub.pem` da antiga em `AUTH_JWT_PREVIOUS_KEY_FILES`. As duas aparecem no JWKS, e os tokens antigos continuam valendo até expirar. Quem ainda tiver o JWKS antigo em cache busca de novo ao ver o `kid` novo, em até 30 segundos. A antiga só pode sair depois de `AUTH_JWT_TTL` mais o `Leeway` dos serviços desde o deploy da nova (com os padrões, 5m30s). Tirar antes derruba tokens ainda válidos.
 
 ## Proteção contra força bruta
 
 São duas camadas, as duas no Redis:
 
-- **Por IP:** 10 logins por minuto e 10 cadastros por hora. Passou disso, `429` com `Retry-After`.
-- **Por conta:** a partir da 5ª senha errada seguida, o e-mail fica bloqueado por 1 minuto, e o tempo dobra a cada nova falha até 15 minutos. Um login certo zera a contagem, e uma hora sem erro também. O bloqueio vale igual para e-mail que não existe, senão ele denunciaria quais contas existem.
+- **Por IP, em cada rota:** passou do limite, `429` com `Retry-After`.
 
-As chaves no Redis são hashes, então IP e e-mail não ficam lá em texto puro.
+  | Rota | Limite por IP |
+  |---|---|
+  | `login` e `login/mfa` | 10 por minuto |
+  | `signup` | 10 por hora |
+  | `password/forgot` e `email/resend` | 5 por hora |
+  | `password/reset` | 10 por hora |
+  | `email/verify` | 20 por hora |
+  | `mfa/setup`, `mfa/enable` e `mfa/disable` | 20 por hora, somados |
+  | `/internal/v1/token` | 3000 por minuto |
+  | `/internal/v1/oauth/token` | 60 por minuto |
+
+- **Por e-mail e IP:** a partir da 5ª senha errada seguida vinda do mesmo IP, aquele IP fica bloqueado para aquele e-mail por 1 minuto, e o tempo dobra a cada nova falha até 15 minutos. Um login certo zera a contagem, e uma hora sem erro também. Quem erra de propósito tranca só a si mesmo, e o dono continua entrando do IP dele.
+- **Teto por conta:** 50 senhas erradas para o mesmo e-mail em uma hora, somando todos os IPs, bloqueiam o e-mail inteiro com a mesma progressão. É isso que segura um ataque espalhado por muitos IPs. Login certo não zera esse teto. Redefinir a senha pelo e-mail zera.
+
+Os bloqueios valem igual para e-mail que não existe, senão denunciariam quais contas existem. O código do MFA tem um bloqueio progressivo próprio, por usuário.
+
+Endereços IPv6 contam por /64, porque quem tem um /64 tem bilhões de endereços para trocar a cada tentativa. As chaves no Redis são hashes, então IP e e-mail não ficam lá em texto puro.
 
 Atrás de proxy ou BFF, informe os IPs dele em `AUTH_TRUSTED_PROXIES`. Sem isso o `X-Forwarded-For` é ignorado, e todo mundo atrás do proxy divide o mesmo limite.
 
 ## Auditoria
 
-Cadastro, cadastro duplicado, login certo, login errado, login bloqueado e logout viram uma linha em `audit_events` no Postgres, com IP, user agent e request id. Se a gravação falhar, o login segue e o erro vai para o log. O excesso de requisições por IP fica só no log, para um ataque não sair enchendo a tabela.
+Cada evento abaixo vira uma linha em `audit_events` no Postgres, com IP, user agent e request id:
+
+- conta: `signup.created`, `signup.duplicate`, `login.succeeded`, `login.failed`, `login.locked`, `logout`
+- e-mail e senha: `email.verified`, `password.reset_requested`, `password.reset`
+- MFA: `login.mfa_required`, `login.mfa_failed`, `mfa.enabled`, `mfa.disabled`, `mfa.recovery_code_used`
+- clientes: `client.auth_failed`, `client.forbidden` (escopo ou audiência negados), `client.token_issued`
+
+ Se a gravação falhar, o login segue e o erro vai para o log. O excesso de requisições por IP fica só no log, para um ataque não sair enchendo a tabela.
 
 ## Configuração
 
 | Variável | Padrão | |
 |---|---|---|
-| `AUTH_DATABASE_URL` | obrigatória | em produção exige `sslmode=require` ou mais forte |
+| `AUTH_DATABASE_URL` | obrigatória | em produção exige `sslmode=verify-full` |
 | `AUTH_REDIS_URL` | obrigatória | em produção exige `rediss://` |
 | `AUTH_SESSION_TTL` | `12h` | entre `5m` e `720h` |
 | `AUTH_TRUSTED_PROXIES` | vazio | IPs ou CIDRs separados por vírgula |
 | `AUTH_ENV` | `development` | `development` ou `production` |
 | `AUTH_HTTP_ADDR` | `:8080` | listener público |
 | `AUTH_INTERNAL_ADDR` | `:8081` | listener interno, precisa ser diferente do público |
+| `AUTH_INTERNAL_TLS_CERT_FILE` | vazio | certificado PEM do listener interno, obrigatório em produção |
+| `AUTH_INTERNAL_TLS_KEY_FILE` | vazio | chave PEM do listener interno, obrigatória em produção |
 | `AUTH_JWT_KEY_FILE` | vazio | PEM PKCS#8 Ed25519, obrigatória em produção |
 | `AUTH_JWT_PREVIOUS_KEY_FILES` | vazio | chaves antigas ainda publicadas no JWKS, separadas por vírgula |
 | `AUTH_JWT_ISSUER` | `auth-service` | |
-| `AUTH_JWT_AUDIENCE` | `internal` | |
+| `AUTH_JWT_AUDIENCE` | `internal` | audiência de quem não pede `audience`, só para a migração |
 | `AUTH_JWT_TTL` | `5m` | entre `1m` e `15m` |
 | `AUTH_PUBLIC_URL` | `http://localhost:5173` | endereço da SPA usado nos links, obrigatório e `https` em produção |
 | `AUTH_SMTP_URL` | vazio | `smtp://user:senha@host:587` ou `smtps://...:465`, obrigatório em produção |
@@ -265,6 +294,7 @@ O código está pronto, mas lançar depende de coisas que não moram no reposit�
 **Infra**
 - [ ] TLS terminando no proxy, com o IP dele em `AUTH_TRUSTED_PROXIES`
 - [ ] Porta `8081` alcançável só pela rede interna (network policy ou security group), nunca pela internet
+- [ ] Certificado da `8081` emitido por uma CA interna, com a CA distribuída para os serviços (`authn.WithRootCAs`)
 - [ ] Postgres com `sslmode=verify-full`, backup automático e restauração testada
 - [ ] Redis com `rediss://`, AOF ligado e `maxmemory-policy noeviction`. Se o Redis despejar chaves sob pressão, somem sessões e, pior, os contadores de bloqueio
 - [ ] Migrations rodando antes do deploy (`/app/migrate up`)
@@ -272,7 +302,8 @@ O código está pronto, mas lançar depende de coisas que não moram no reposit�
 **Segredos**
 - [ ] `AUTH_JWT_KEY_FILE`, `AUTH_MFA_KEY` e a senha do SMTP num cofre, não em variável solta
 - [ ] Backup da `AUTH_MFA_KEY`. Perder essa chave tranca todo mundo que usa MFA
-- [ ] Cliente do BFF criado em produção (`client create bff session:exchange`)
+- [ ] Cliente do BFF criado em produção (`client create bff session:exchange --audience ...`) com a lista de serviços que ele chama
+- [ ] Cada microsserviço validando a própria audiência, e nenhum aceitando `internal`
 
 **E-mail**
 - [ ] SPF, DKIM e DMARC no domínio do `AUTH_MAIL_FROM`. Sem eles os links caem no spam

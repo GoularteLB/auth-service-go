@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -197,8 +198,50 @@ func TestNewRemoteKeysValidatesURL(t *testing.T) {
 			t.Errorf("aceitou %q", bad)
 		}
 	}
-	if _, err := NewRemoteKeys("http://auth-service:8081/.well-known/jwks.json"); err != nil {
+	for _, good := range []string{
+		"https://auth-service:8081/.well-known/jwks.json",
+		"http://localhost:8081/.well-known/jwks.json",
+		"http://LocalHost:8081/.well-known/jwks.json",
+		"http://127.0.0.1:8081/.well-known/jwks.json",
+		"http://[::1]:8081/.well-known/jwks.json",
+	} {
+		if _, err := NewRemoteKeys(good); err != nil {
+			t.Errorf("recusou %q: %v", good, err)
+		}
+	}
+}
+
+func TestNewRemoteKeysRejectsPlainHTTPOutsideLoopback(t *testing.T) {
+	const internal = "http://auth-service:8081/.well-known/jwks.json"
+	if _, err := NewRemoteKeys(internal); err == nil {
+		t.Fatal("aceitou http:// fora de localhost")
+	}
+	if _, err := NewRemoteKeys(internal, AllowInsecureHTTP()); err != nil {
+		t.Fatalf("AllowInsecureHTTP não liberou http://: %v", err)
+	}
+}
+
+func TestRemoteKeysWithRootCAs(t *testing.T) {
+	pub, _ := newKey(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(JWKS{Keys: []JWK{NewJWK(pub)}})
+	}))
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+
+	untrusted := mustRemote(t, srv.URL)
+	if _, err := untrusted.Key(ctx, Thumbprint(pub)); err == nil {
+		t.Fatal("confiou num certificado fora da cadeia")
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	trusted, err := NewRemoteKeys(srv.URL, WithRootCAs(pool))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := trusted.Key(ctx, Thumbprint(pub)); err != nil {
+		t.Fatalf("não confiou na CA informada: %v", err)
 	}
 }
 

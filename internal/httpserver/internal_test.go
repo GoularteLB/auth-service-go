@@ -20,8 +20,9 @@ import (
 )
 
 type memClients map[string]struct {
-	secret string
-	scopes []string
+	secret    string
+	scopes    []string
+	audiences []string
 }
 
 func (m memClients) Active(_ context.Context, id string) (client.Client, [32]byte, error) {
@@ -29,7 +30,7 @@ func (m memClients) Active(_ context.Context, id string) (client.Client, [32]byt
 	if !ok {
 		return client.Client{}, [32]byte{}, client.ErrNotFound
 	}
-	return client.Client{ClientID: id, Scopes: c.scopes}, client.HashSecret(c.secret), nil
+	return client.Client{ClientID: id, Scopes: c.scopes, Audiences: c.audiences}, client.HashSecret(c.secret), nil
 }
 
 type discardAudit struct{}
@@ -52,6 +53,7 @@ func newInternalEnv(t *testing.T, a *fakeAuth) internalEnv {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	repo := memClients{
 		"cli_bff":     {secret: "segredo-bff", scopes: []string{client.ScopeSessionExchange}},
+		"cli_bff_aud": {secret: "segredo-bff", scopes: []string{client.ScopeSessionExchange}, audiences: []string{"pedidos"}},
 		"cli_pedidos": {secret: "segredo-pedidos", scopes: []string{"estoque:ler", "estoque:escrever"}},
 	}
 	limiter := newFakeLimiter()
@@ -154,6 +156,57 @@ func TestExchangeSessionForToken(t *testing.T) {
 	}
 	if !c.HasAMR(authn.AMRPassword) || c.HasAMR(authn.AMRMFA) {
 		t.Errorf("amr = %v", c.AMR)
+	}
+}
+
+func TestExchangeWithAudience(t *testing.T) {
+	a := newFakeAuth()
+	session := loggedInSession(t, a)
+	env := newInternalEnv(t, a)
+	pub, _ := env.issuer.JWKS().Keys[0].PublicKey()
+	keys := authn.StaticKeys{env.issuer.KeyID(): pub}
+
+	req := jsonRequest(http.MethodPost, "/internal/v1/token", `{"session_token":"`+session+`","audience":"pedidos"}`)
+	req.SetBasicAuth("cli_bff_aud", "segredo-bff")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	var resp tokenResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	pedidos := &authn.Verifier{Keys: keys, Issuer: "auth-service", Audience: "pedidos"}
+	if _, err := pedidos.Verify(context.Background(), resp.AccessToken); err != nil {
+		t.Fatalf("pedidos recusou o token dele: %v", err)
+	}
+	if _, err := env.verifier().Verify(context.Background(), resp.AccessToken); !errors.Is(err, authn.ErrWrongAudience) {
+		t.Fatalf("token de pedidos valeu na audiência genérica: %v", err)
+	}
+
+	for _, body := range []string{
+		`{"session_token":"` + session + `","audience":"pagamentos"}`,
+		`{"session_token":"` + session + `"}`,
+	} {
+		req = jsonRequest(http.MethodPost, "/internal/v1/token", body)
+		req.SetBasicAuth("cli_bff_aud", "segredo-bff")
+		rec = httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_target") {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestExchangeAuthenticatesBeforeReadingBody(t *testing.T) {
+	env := newInternalEnv(t, newFakeAuth())
+	req := jsonRequest(http.MethodPost, "/internal/v1/token", `{isso não é json`)
+	req.SetBasicAuth("cli_bff", "errado")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid_client") {
+		t.Fatalf("corpo foi lido antes de autenticar: %d %s", rec.Code, rec.Body)
 	}
 }
 
@@ -291,6 +344,7 @@ func TestClientCredentialsErrors(t *testing.T) {
 		{"segredo errado", clientTokenRequest(good, "cli_pedidos", "errado"), http.StatusUnauthorized, "invalid_client"},
 		{"grant errado", clientTokenRequest(url.Values{"grant_type": {"password"}}, "cli_pedidos", "segredo-pedidos"), http.StatusBadRequest, "unsupported_grant_type"},
 		{"escopo que não tem", clientTokenRequest(url.Values{"grant_type": {"client_credentials"}, "scope": {"admin"}}, "cli_pedidos", "segredo-pedidos"), http.StatusBadRequest, "invalid_scope"},
+		{"audiência que não tem", clientTokenRequest(url.Values{"grant_type": {"client_credentials"}, "audience": {"pagamentos"}}, "cli_pedidos", "segredo-pedidos"), http.StatusBadRequest, "invalid_target"},
 		{"segredo no corpo", clientTokenRequest(url.Values{"grant_type": {"client_credentials"}, "client_id": {"cli_pedidos"}, "client_secret": {"segredo-pedidos"}}, "", ""), http.StatusBadRequest, "invalid_request"},
 	}
 	for _, tt := range tests {

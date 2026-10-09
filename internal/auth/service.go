@@ -59,43 +59,46 @@ type Auditor interface {
 }
 
 type Deps struct {
-	Users     Users
-	Sessions  Sessions
-	Hasher    *password.Hasher
-	Lockout   Lockout
-	Audit     Auditor
-	Tokens    OneTimeTokens
-	Mailer    Mailer
-	MFA       MFA
-	PublicURL string
-	Logger    *slog.Logger
+	Users          Users
+	Sessions       Sessions
+	Hasher         *password.Hasher
+	Lockout        Lockout
+	AccountLockout Lockout
+	Audit          Auditor
+	Tokens         OneTimeTokens
+	Mailer         Mailer
+	MFA            MFA
+	PublicURL      string
+	Logger         *slog.Logger
 }
 
 type Service struct {
-	users     Users
-	sessions  Sessions
-	hasher    *password.Hasher
-	lockout   Lockout
-	audit     Auditor
-	tokens    OneTimeTokens
-	mailer    Mailer
-	mfa       MFA
-	publicURL string
-	logger    *slog.Logger
+	users          Users
+	sessions       Sessions
+	hasher         *password.Hasher
+	lockout        Lockout
+	accountLockout Lockout
+	audit          Auditor
+	tokens         OneTimeTokens
+	mailer         Mailer
+	mfa            MFA
+	publicURL      string
+	logger         *slog.Logger
 }
 
 func NewService(d Deps) *Service {
 	return &Service{
-		users:     d.Users,
-		sessions:  d.Sessions,
-		hasher:    d.Hasher,
-		lockout:   d.Lockout,
-		audit:     d.Audit,
-		tokens:    d.Tokens,
-		mailer:    d.Mailer,
-		mfa:       d.MFA,
-		publicURL: strings.TrimRight(d.PublicURL, "/"),
-		logger:    d.Logger,
+		users:          d.Users,
+		sessions:       d.Sessions,
+		hasher:         d.Hasher,
+		lockout:        d.Lockout,
+		accountLockout: d.AccountLockout,
+		audit:          d.Audit,
+		tokens:         d.Tokens,
+		mailer:         d.Mailer,
+		mfa:            d.MFA,
+		publicURL:      strings.TrimRight(d.PublicURL, "/"),
+		logger:         d.Logger,
 	}
 }
 
@@ -135,7 +138,7 @@ func (s *Service) Login(ctx context.Context, email, plain string) (string, error
 		return "", s.reject(ctx, plain)
 	}
 
-	retry, err := s.lockout.Check(ctx, email)
+	retry, err := s.checkPasswordLock(ctx, email)
 	if err != nil {
 		return "", err
 	}
@@ -166,9 +169,7 @@ func (s *Service) Login(ctx context.Context, email, plain string) (string, error
 	if s.hasher.NeedsRehash(u.PasswordHash) {
 		s.rehash(ctx, u.ID, plain)
 	}
-	if err := s.lockout.Reset(ctx, email); err != nil {
-		s.logger.WarnContext(ctx, "falha ao limpar bloqueio", slog.Any("error", err))
-	}
+	s.clearPasswordLock(ctx, email)
 
 	mfaOn, err := s.mfa.Enabled(ctx, u.ID)
 	if err != nil {
@@ -240,7 +241,7 @@ func (s *Service) reject(ctx context.Context, plain string) error {
 
 func (s *Service) fail(ctx context.Context, e audit.Event) error {
 	s.record(ctx, e)
-	if _, err := s.lockout.Fail(ctx, e.Email); err != nil {
+	if err := s.failPassword(ctx, e.Email); err != nil {
 		return err
 	}
 	return ErrInvalidCredentials

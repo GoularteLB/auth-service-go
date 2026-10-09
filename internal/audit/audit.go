@@ -49,6 +49,14 @@ type Client struct {
 	RequestID string
 }
 
+func (c Client) Bucket() string {
+	ip, err := netip.ParseAddr(c.IP)
+	if err != nil || !ip.Is6() || ip.Is4In6() {
+		return c.IP
+	}
+	return netip.PrefixFrom(ip, 64).Masked().String()
+}
+
 type ctxKey struct{}
 
 func WithClient(ctx context.Context, c Client) context.Context {

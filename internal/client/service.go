@@ -17,6 +17,7 @@ import (
 var (
 	ErrInvalidClient = errors.New("cliente inválido")
 	ErrForbidden     = errors.New("cliente sem permissão para esta operação")
+	ErrInvalidTarget = errors.New("audiência não permitida para este cliente")
 )
 
 type Repository interface {
@@ -24,7 +25,7 @@ type Repository interface {
 }
 
 type Issuer interface {
-	Issue(subject, clientID string, scopes, amr []string) (string, time.Duration, error)
+	Issue(subject, clientID, audience string, scopes, amr []string) (string, time.Duration, error)
 }
 
 type Auditor interface {
@@ -83,8 +84,12 @@ func (s *Service) Authorize(ctx context.Context, clientID, secret, scope string)
 	return c, nil
 }
 
-func (s *Service) Token(ctx context.Context, clientID, secret, scope string) (Token, error) {
+func (s *Service) Token(ctx context.Context, clientID, secret, scope, audience string) (Token, error) {
 	c, err := s.Authenticate(ctx, clientID, secret)
+	if err != nil {
+		return Token{}, err
+	}
+	audience, err = s.Audience(ctx, c, audience)
 	if err != nil {
 		return Token{}, err
 	}
@@ -100,12 +105,23 @@ func (s *Service) Token(ctx context.Context, clientID, secret, scope string) (To
 		granted, _ = NormalizeScopes(requested)
 	}
 
-	value, ttl, err := s.tokens.Issue(c.ClientID, c.ClientID, granted, nil)
+	value, ttl, err := s.tokens.Issue(c.ClientID, c.ClientID, audience, granted, nil)
 	if err != nil {
 		return Token{}, err
 	}
 	s.record(ctx, audit.Event{Type: audit.ClientTokenIssued, ClientID: c.ClientID})
 	return Token{Value: value, TTL: ttl, Scopes: granted}, nil
+}
+
+func (s *Service) Audience(ctx context.Context, c Client, requested string) (string, error) {
+	if requested == "" && len(c.Audiences) == 0 {
+		return "", nil
+	}
+	if requested != "" && slices.Contains(c.Audiences, requested) {
+		return requested, nil
+	}
+	s.record(ctx, audit.Event{Type: audit.ClientForbidden, ClientID: c.ClientID})
+	return "", fmt.Errorf("%w: %q", ErrInvalidTarget, requested)
 }
 
 func (s *Service) record(ctx context.Context, e audit.Event) {

@@ -127,9 +127,7 @@ func (s *Service) ResetPassword(ctx context.Context, token, plain string) error 
 	if err := s.users.MarkEmailVerified(ctx, u.ID); err != nil {
 		s.logger.WarnContext(ctx, "falha ao marcar e-mail verificado", slog.Any("error", err))
 	}
-	if err := s.lockout.Reset(ctx, u.Email); err != nil {
-		s.logger.WarnContext(ctx, "falha ao limpar bloqueio", slog.Any("error", err))
-	}
+	s.clearAccountLock(ctx, u.Email)
 
 	s.record(ctx, audit.Event{Type: audit.PasswordReset, UserID: u.ID, Email: u.Email})
 	s.send(ctx, mail.Message{

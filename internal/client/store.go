@@ -17,9 +17,10 @@ import (
 const ScopeSessionExchange = "session:exchange"
 
 var (
-	ErrNotFound     = errors.New("cliente não encontrado")
-	ErrInvalidName  = errors.New("nome do cliente precisa ter entre 1 e 100 caracteres")
-	ErrInvalidScope = errors.New("escopo inválido")
+	ErrNotFound        = errors.New("cliente não encontrado")
+	ErrInvalidName     = errors.New("nome do cliente precisa ter entre 1 e 100 caracteres")
+	ErrInvalidScope    = errors.New("escopo inválido")
+	ErrInvalidAudience = errors.New("audiência inválida")
 )
 
 var scopePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9:._-]{0,63}$`)
@@ -28,6 +29,7 @@ type Client struct {
 	ClientID  string
 	Name      string
 	Scopes    []string
+	Audiences []string
 	CreatedAt time.Time
 	RevokedAt *time.Time
 }
@@ -40,7 +42,7 @@ func NewStore(db *pgxpool.Pool) *Store {
 	return &Store{db: db}
 }
 
-func (s *Store) Create(ctx context.Context, name string, scopes []string) (Client, string, error) {
+func (s *Store) Create(ctx context.Context, name string, scopes, audiences []string) (Client, string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || len([]rune(name)) > 100 {
 		return Client{}, "", ErrInvalidName
@@ -49,13 +51,17 @@ func (s *Store) Create(ctx context.Context, name string, scopes []string) (Clien
 	if err != nil {
 		return Client{}, "", err
 	}
+	audiences, err = NormalizeAudiences(audiences)
+	if err != nil {
+		return Client{}, "", err
+	}
 
-	c := Client{ClientID: "cli_" + strings.ToLower(rand.Text()), Name: name, Scopes: scopes}
+	c := Client{ClientID: "cli_" + strings.ToLower(rand.Text()), Name: name, Scopes: scopes, Audiences: audiences}
 	secret := rand.Text() + rand.Text()
 	hash := HashSecret(secret)
 	err = s.db.QueryRow(ctx,
-		`INSERT INTO clients (client_id, name, secret_hash, scopes) VALUES ($1, $2, $3, $4) RETURNING created_at`,
-		c.ClientID, c.Name, hash[:], c.Scopes,
+		`INSERT INTO clients (client_id, name, secret_hash, scopes, audiences) VALUES ($1, $2, $3, $4, $5) RETURNING created_at`,
+		c.ClientID, c.Name, hash[:], c.Scopes, c.Audiences,
 	).Scan(&c.CreatedAt)
 	if err != nil {
 		return Client{}, "", fmt.Errorf("inserindo cliente: %w", err)
@@ -67,9 +73,9 @@ func (s *Store) Active(ctx context.Context, clientID string) (Client, [32]byte, 
 	var c Client
 	var raw []byte
 	err := s.db.QueryRow(ctx,
-		`SELECT client_id, name, scopes, created_at, secret_hash FROM clients
+		`SELECT client_id, name, scopes, audiences, created_at, secret_hash FROM clients
 		 WHERE client_id = $1 AND revoked_at IS NULL`, clientID,
-	).Scan(&c.ClientID, &c.Name, &c.Scopes, &c.CreatedAt, &raw)
+	).Scan(&c.ClientID, &c.Name, &c.Scopes, &c.Audiences, &c.CreatedAt, &raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Client{}, [32]byte{}, ErrNotFound
 	}
@@ -82,6 +88,22 @@ func (s *Store) Active(ctx context.Context, clientID string) (Client, [32]byte, 
 	}
 	copy(hash[:], raw)
 	return c, hash, nil
+}
+
+func (s *Store) SetAudiences(ctx context.Context, clientID string, audiences []string) ([]string, error) {
+	audiences, err := NormalizeAudiences(audiences)
+	if err != nil {
+		return nil, err
+	}
+	tag, err := s.db.Exec(ctx,
+		`UPDATE clients SET audiences = $2 WHERE client_id = $1 AND revoked_at IS NULL`, clientID, audiences)
+	if err != nil {
+		return nil, fmt.Errorf("atualizando audiências: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return audiences, nil
 }
 
 func (s *Store) Revoke(ctx context.Context, clientID string) error {
@@ -98,7 +120,7 @@ func (s *Store) Revoke(ctx context.Context, clientID string) error {
 
 func (s *Store) List(ctx context.Context) ([]Client, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT client_id, name, scopes, created_at, revoked_at FROM clients ORDER BY created_at`)
+		`SELECT client_id, name, scopes, audiences, created_at, revoked_at FROM clients ORDER BY created_at`)
 	if err != nil {
 		return nil, fmt.Errorf("listando clientes: %w", err)
 	}
@@ -107,7 +129,7 @@ func (s *Store) List(ctx context.Context) ([]Client, error) {
 	var out []Client
 	for rows.Next() {
 		var c Client
-		if err := rows.Scan(&c.ClientID, &c.Name, &c.Scopes, &c.CreatedAt, &c.RevokedAt); err != nil {
+		if err := rows.Scan(&c.ClientID, &c.Name, &c.Scopes, &c.Audiences, &c.CreatedAt, &c.RevokedAt); err != nil {
 			return nil, fmt.Errorf("lendo cliente: %w", err)
 		}
 		out = append(out, c)
@@ -120,15 +142,23 @@ func HashSecret(secret string) [32]byte {
 }
 
 func NormalizeScopes(scopes []string) ([]string, error) {
+	return normalizeNames(scopes, ErrInvalidScope)
+}
+
+func NormalizeAudiences(audiences []string) ([]string, error) {
+	return normalizeNames(audiences, ErrInvalidAudience)
+}
+
+func normalizeNames(names []string, invalid error) ([]string, error) {
 	seen := map[string]bool{}
 	out := []string{}
-	for _, s := range scopes {
+	for _, s := range names {
 		s = strings.TrimSpace(s)
 		if s == "" || seen[s] {
 			continue
 		}
 		if !scopePattern.MatchString(s) {
-			return nil, fmt.Errorf("%w: %q", ErrInvalidScope, s)
+			return nil, fmt.Errorf("%w: %q", invalid, s)
 		}
 		seen[s] = true
 		out = append(out, s)
