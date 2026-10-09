@@ -133,6 +133,9 @@ func TestResetPasswordFlow(t *testing.T) {
 	if err := env.svc.ResetPassword(ctx, token, "uma-senha-nova-e-longa"); err != nil {
 		t.Fatalf("senha inválida não deveria ter queimado o link: %v", err)
 	}
+	if env.lockout.total() != 0 || env.account.total() != 0 {
+		t.Error("redefinir a senha não liberou o bloqueio")
+	}
 
 	for _, s := range []string{sessionA, sessionB} {
 		if _, err := env.svc.Current(ctx, s); !errors.Is(err, ErrUnauthenticated) {

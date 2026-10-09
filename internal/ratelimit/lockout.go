@@ -43,6 +43,13 @@ var DefaultLockoutPolicy = LockoutPolicy{
 	Memory:    time.Hour,
 }
 
+var AccountLockoutPolicy = LockoutPolicy{
+	Threshold: 50,
+	BaseDelay: time.Minute,
+	MaxDelay:  15 * time.Minute,
+	Memory:    time.Hour,
+}
+
 type Lockout struct {
 	rdb    *redis.Client
 	policy LockoutPolicy

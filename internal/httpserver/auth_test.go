@@ -177,6 +177,9 @@ func (f *fakeAuth) SetupMFA(ctx context.Context, session, plain string) (mfa.Set
 	if _, err := f.Current(ctx, session); err != nil {
 		return mfa.Setup{}, err
 	}
+	if plain == "email-nao-confirmado" {
+		return mfa.Setup{}, auth.ErrEmailNotVerified
+	}
 	if plain != "uma-senha-bem-longa" {
 		return mfa.Setup{}, auth.ErrInvalidCredentials
 	}
@@ -638,6 +641,7 @@ func TestMFAManagement(t *testing.T) {
 	}{
 		{"setup sem sessão", "/v1/auth/mfa/setup", `{"password":"uma-senha-bem-longa"}`, false, http.StatusUnauthorized, ""},
 		{"setup senha errada", "/v1/auth/mfa/setup", `{"password":"errada"}`, true, http.StatusForbidden, ""},
+		{"setup sem e-mail confirmado", "/v1/auth/mfa/setup", `{"password":"email-nao-confirmado"}`, true, http.StatusForbidden, "confirme seu e-mail"},
 		{"setup ok", "/v1/auth/mfa/setup", `{"password":"uma-senha-bem-longa"}`, true, http.StatusOK, "otpauth_url"},
 		{"enable código errado", "/v1/auth/mfa/enable", `{"code":"000000"}`, true, http.StatusBadRequest, ""},
 		{"enable ok", "/v1/auth/mfa/enable", `{"code":"123456"}`, true, http.StatusOK, "recovery_codes"},

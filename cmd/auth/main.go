@@ -84,16 +84,17 @@ func run(ctx context.Context) error {
 	}
 
 	authService := auth.NewService(auth.Deps{
-		Users:     user.NewStore(pool),
-		Sessions:  session.NewStore(rdb, cfg.SessionTTL),
-		Hasher:    hasher,
-		Lockout:   ratelimit.NewLockout(rdb, ratelimit.DefaultLockoutPolicy),
-		Audit:     auditStore,
-		Tokens:    onetime.NewStore(rdb),
-		Mailer:    mailQueue,
-		MFA:       mfaService,
-		PublicURL: cfg.PublicURL,
-		Logger:    logger,
+		Users:          user.NewStore(pool),
+		Sessions:       session.NewStore(rdb, cfg.SessionTTL),
+		Hasher:         hasher,
+		Lockout:        ratelimit.NewLockout(rdb, ratelimit.DefaultLockoutPolicy),
+		AccountLockout: ratelimit.NewLockout(rdb, ratelimit.AccountLockoutPolicy),
+		Audit:          auditStore,
+		Tokens:         onetime.NewStore(rdb),
+		Mailer:         mailQueue,
+		MFA:            mfaService,
+		PublicURL:      cfg.PublicURL,
+		Logger:         logger,
 	})
 
 	issuer, err := newIssuer(cfg, logger)
@@ -131,8 +132,16 @@ func run(ctx context.Context) error {
 	g.Go(func() error {
 		return httpserver.Run(gctx, httpserver.New(cfg.HTTPAddr, public, logger), cfg.ShutdownTimeout)
 	})
+	internalSrv := httpserver.New(cfg.InternalAddr, internal, logger)
+	if cfg.InternalTLS.Enabled() {
+		if err := httpserver.UseTLS(internalSrv, cfg.InternalTLS.CertFile, cfg.InternalTLS.KeyFile); err != nil {
+			return err
+		}
+	} else {
+		logger.Warn("porta interna sem tls, use só em desenvolvimento")
+	}
 	g.Go(func() error {
-		return httpserver.Run(gctx, httpserver.New(cfg.InternalAddr, internal, logger), cfg.ShutdownTimeout)
+		return httpserver.Run(gctx, internalSrv, cfg.ShutdownTimeout)
 	})
 	if err := g.Wait(); err != nil {
 		return err

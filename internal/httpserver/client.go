@@ -71,8 +71,9 @@ func isTrusted(ip netip.Addr, trusted []netip.Prefix) bool {
 
 func rateLimit(limiter RateLimiter, logger *slog.Logger, name string, rate Rate, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := audit.ClientFrom(r.Context()).IP
-		retry, err := limiter.Allow(r.Context(), name+":"+ip, rate.Limit, rate.Window)
+		c := audit.ClientFrom(r.Context())
+		ip := c.IP
+		retry, err := limiter.Allow(r.Context(), name+":"+c.Bucket(), rate.Limit, rate.Window)
 		if err != nil {
 			logger.ErrorContext(r.Context(), "falha no rate limit",
 				slog.String("request_id", RequestIDFrom(r.Context())),
