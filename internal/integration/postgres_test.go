@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/netip"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,20 +100,35 @@ func TestClientStore(t *testing.T) {
 	ctx := context.Background()
 	clients := client.NewStore(pool)
 
-	c, secret, err := clients.Create(ctx, "bff", []string{client.ScopeSessionExchange, "x:y", client.ScopeSessionExchange})
+	c, secret, err := clients.Create(ctx, "bff", []string{client.ScopeSessionExchange, "x:y", client.ScopeSessionExchange}, []string{"pedidos", "pedidos"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Scopes) != 2 {
-		t.Fatalf("escopos não foram normalizados: %v", c.Scopes)
+	if len(c.Scopes) != 2 || len(c.Audiences) != 1 {
+		t.Fatalf("escopos ou audiências não foram normalizados: %v %v", c.Scopes, c.Audiences)
 	}
 
 	active, hash, err := clients.Active(ctx, c.ClientID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hash != client.HashSecret(secret) || active.Name != "bff" || len(active.Scopes) != 2 {
+	if hash != client.HashSecret(secret) || active.Name != "bff" || len(active.Scopes) != 2 || len(active.Audiences) != 1 {
 		t.Fatalf("cliente lido diferente do criado: %+v", active)
+	}
+
+	updated, err := clients.SetAudiences(ctx, c.ClientID, []string{"pedidos", "estoque"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _, _ = clients.Active(ctx, c.ClientID)
+	if len(updated) != 2 || strings.Join(active.Audiences, " ") != "pedidos estoque" {
+		t.Fatalf("audiências não foram atualizadas: %v", active.Audiences)
+	}
+	if _, err := clients.SetAudiences(ctx, c.ClientID, []string{"Inválida"}); !errors.Is(err, client.ErrInvalidAudience) {
+		t.Fatalf("audiência inválida: %v", err)
+	}
+	if _, err := clients.SetAudiences(ctx, "cli_nao_existe", nil); !errors.Is(err, client.ErrNotFound) {
+		t.Fatalf("cliente inexistente: %v", err)
 	}
 
 	if err := clients.Revoke(ctx, c.ClientID); err != nil {
@@ -133,7 +149,7 @@ func TestClientStore(t *testing.T) {
 		t.Fatalf("lista inesperada: %+v", list)
 	}
 
-	if _, _, err := clients.Create(ctx, "", nil); !errors.Is(err, client.ErrInvalidName) {
+	if _, _, err := clients.Create(ctx, "", nil, nil); !errors.Is(err, client.ErrInvalidName) {
 		t.Fatalf("nome vazio: %v", err)
 	}
 }

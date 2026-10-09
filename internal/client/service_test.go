@@ -31,12 +31,12 @@ func (f *fakeRepo) Active(_ context.Context, id string) (Client, [32]byte, error
 }
 
 type fakeIssuer struct {
-	subject, clientID string
-	scopes            []string
+	subject, clientID, audience string
+	scopes                      []string
 }
 
-func (f *fakeIssuer) Issue(subject, clientID string, scopes, _ []string) (string, time.Duration, error) {
-	f.subject, f.clientID, f.scopes = subject, clientID, scopes
+func (f *fakeIssuer) Issue(subject, clientID, audience string, scopes, _ []string) (string, time.Duration, error) {
+	f.subject, f.clientID, f.audience, f.scopes = subject, clientID, audience, scopes
 	return "jwt", 5 * time.Minute, nil
 }
 
@@ -64,8 +64,8 @@ func (f *fakeAudit) last() audit.Event {
 func newTestService() (*Service, *fakeIssuer, *fakeAudit) {
 	repo := &fakeRepo{
 		clients: map[string]Client{
-			"cli_bff":     {ClientID: "cli_bff", Scopes: []string{ScopeSessionExchange}},
-			"cli_pedidos": {ClientID: "cli_pedidos", Scopes: []string{"estoque:ler", "estoque:escrever"}},
+			"cli_bff":     {ClientID: "cli_bff", Scopes: []string{ScopeSessionExchange}, Audiences: []string{"pedidos"}},
+			"cli_pedidos": {ClientID: "cli_pedidos", Scopes: []string{"estoque:ler", "estoque:escrever"}, Audiences: []string{"estoque"}},
 		},
 		secrets: map[string]string{"cli_bff": "segredo-bff", "cli_pedidos": "segredo-pedidos"},
 	}
@@ -127,7 +127,7 @@ func TestToken(t *testing.T) {
 	svc, iss, aud := newTestService()
 	ctx := context.Background()
 
-	tok, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "")
+	tok, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "", "estoque")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestToken(t *testing.T) {
 		t.Errorf("emissão não auditada: %+v", aud.last())
 	}
 
-	tok, err = svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "estoque:ler estoque:ler")
+	tok, err = svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "estoque:ler estoque:ler", "estoque")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +149,47 @@ func TestToken(t *testing.T) {
 		t.Errorf("escopo reduzido errado: %v", tok.Scopes)
 	}
 
-	if _, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "estoque:ler admin"); !errors.Is(err, ErrInvalidScope) {
+	if _, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "estoque:ler admin", "estoque"); !errors.Is(err, ErrInvalidScope) {
 		t.Fatalf("pediu escopo que não tem e recebeu %v", err)
+	}
+}
+
+func TestAudience(t *testing.T) {
+	svc, iss, aud := newTestService()
+	ctx := context.Background()
+
+	if _, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "", "estoque"); err != nil {
+		t.Fatal(err)
+	}
+	if iss.audience != "estoque" {
+		t.Errorf("audiência = %q", iss.audience)
+	}
+	if _, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "", ""); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("cliente com lista de audiências recebeu a padrão sem pedir: %v", err)
+	}
+	if _, err := svc.Token(ctx, "cli_pedidos", "segredo-pedidos", "", "pagamentos"); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("audiência fora da lista: %v", err)
+	}
+	if aud.last().Type != audit.ClientForbidden {
+		t.Error("recusa de audiência não foi auditada")
+	}
+
+	legacy := Client{ClientID: "cli_antigo"}
+	if got, err := svc.Audience(ctx, legacy, ""); err != nil || got != "" {
+		t.Fatalf("cliente sem lista deveria cair na audiência padrão: %q %v", got, err)
+	}
+	if _, err := svc.Audience(ctx, legacy, "pedidos"); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("cliente sem lista pediu audiência específica: %v", err)
+	}
+}
+
+func TestNormalizeAudiences(t *testing.T) {
+	got, err := NormalizeAudiences([]string{"pedidos", " pedidos ", "estoque"})
+	if err != nil || strings.Join(got, " ") != "pedidos estoque" {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if _, err := NormalizeAudiences([]string{"Pedidos"}); !errors.Is(err, ErrInvalidAudience) {
+		t.Errorf("aceitou audiência inválida: %v", err)
 	}
 }
 

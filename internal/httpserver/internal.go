@@ -22,13 +22,14 @@ var (
 )
 
 type TokenIssuer interface {
-	Issue(subject, clientID string, scopes, amr []string) (string, time.Duration, error)
+	Issue(subject, clientID, audience string, scopes, amr []string) (string, time.Duration, error)
 	JWKS() authn.JWKS
 }
 
 type Clients interface {
 	Authorize(ctx context.Context, clientID, secret, scope string) (client.Client, error)
-	Token(ctx context.Context, clientID, secret, scope string) (client.Token, error)
+	Audience(ctx context.Context, c client.Client, requested string) (string, error)
+	Token(ctx context.Context, clientID, secret, scope, audience string) (client.Token, error)
 }
 
 type InternalDeps struct {
@@ -42,6 +43,7 @@ type InternalDeps struct {
 
 type exchangeRequest struct {
 	SessionToken string `json:"session_token"`
+	Audience     string `json:"audience"`
 }
 
 type tokenResponse struct {
@@ -108,6 +110,12 @@ func (h *internalHandler) exchange(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &req) {
 		return
 	}
+	audience, err := h.clients.Audience(r.Context(), c, req.Audience)
+	if err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_target")
+		return
+	}
+
 	if req.SessionToken == "" {
 		writeErrorMessage(w, http.StatusUnauthorized, auth.ErrUnauthenticated.Error())
 		return
@@ -123,7 +131,7 @@ func (h *internalHandler) exchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, ttl, err := h.tokens.Issue(u.ID, c.ClientID, nil, amr)
+	token, ttl, err := h.tokens.Issue(u.ID, c.ClientID, audience, nil, amr)
 	if err != nil {
 		h.internalError(w, r, "falha ao emitir token", err)
 		return
@@ -165,13 +173,16 @@ func (h *internalHandler) clientToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := h.clients.Token(r.Context(), id, secret, r.PostForm.Get("scope"))
+	tok, err := h.clients.Token(r.Context(), id, secret, r.PostForm.Get("scope"), r.PostForm.Get("audience"))
 	switch {
 	case errors.Is(err, client.ErrInvalidClient):
 		oauthError(w, http.StatusUnauthorized, "invalid_client")
 		return
 	case errors.Is(err, client.ErrInvalidScope):
 		oauthError(w, http.StatusBadRequest, "invalid_scope")
+		return
+	case errors.Is(err, client.ErrInvalidTarget):
+		oauthError(w, http.StatusBadRequest, "invalid_target")
 		return
 	case err != nil:
 		h.internalError(w, r, "falha ao emitir token de cliente", err)
